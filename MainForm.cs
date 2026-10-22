@@ -921,6 +921,9 @@ namespace MultiTerminal
 
             // The launch-time .mcp.json heal (a796e5f9) logs what it did, so a repair at launch is traceable.
             Services.LaunchCommandBuilder.SetLogger(_debugLogService);
+            // Claude panes run the command ticked in Settings > Claude commands (452d33a4).
+            Services.LaunchCommandBuilder.SetClaudeCommandSource(
+                () => Services.SettingsService.Default.GetDefaultClaudeCommand()?.Command);
 
             // Initialize McpConfigService — used by the project settings form's Sync MCP config and at launch
             // Pass debug log callback so CLI errors are visible in the debug panel

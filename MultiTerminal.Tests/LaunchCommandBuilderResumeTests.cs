@@ -122,6 +122,58 @@ namespace MultiTerminal.Tests
             });
         }
 
+        [Theory]
+        // Plain "claude" adds nothing, so the user's own permissions.defaultMode applies (task 452d33a4).
+        [InlineData("claude", "", "")]
+        [InlineData("  Claude.exe  ", "", "")]
+        [InlineData("claude --dangerously-skip-permissions", " --dangerously-skip-permissions", "")]
+        [InlineData("claude --permission-mode auto", " --permission-mode auto", "")]
+        // MT chooses the session on every launch: -c could attach a helper to its PM's live session.
+        [InlineData("claude -c", "", "-c")]
+        [InlineData("claude --continue --permission-mode auto", " --permission-mode auto", "--continue")]
+        [InlineData("claude -r 0f8fad5b-d9cb-469f-a165-70867728950e --verbose", " --verbose", "-r 0f8fad5b-d9cb-469f-a165-70867728950e")]
+        [InlineData("claude --resume --verbose", " --verbose", "--resume")]
+        [InlineData("claude --session-id=abc --name=Bob -n Eve", "", "--session-id=abc --name=Bob -n Eve")]
+        [InlineData("claude -nBob -r1234 --verbose", " --verbose", "-nBob -r1234")]
+        // The tail lands unquoted in PowerShell -Command: one unsafe token drops the whole tail, so
+        // no second statement runs and no quoted value is passed in pieces.
+        [InlineData("claude --append-system-prompt \"hi there\" --verbose", "", "--append-system-prompt \"hi there\" --verbose")]
+        [InlineData("claude --verbose ; calc", "", "--verbose ; calc")]
+        [InlineData("claude --model opus;calc", "", "--model opus;calc")]
+        [InlineData("claude --verbose @args", "", "--verbose @args")]
+        [InlineData("claude --add-dir C:/x,D:/y --model user@host", " --add-dir C:/x,D:/y --model user@host", "")]
+        // Something ticked that is not claude: no flag rather than silently picking bypass.
+        [InlineData("npx claude", "", "npx claude")]
+        // Nothing ticked (or no saved list): MT's previous behaviour.
+        [InlineData(null, " --dangerously-skip-permissions", "")]
+        [InlineData("   ", " --dangerously-skip-permissions", "")]
+        public void Ticked_command_becomes_the_launch_arguments(string ticked, string expected, string expectedIgnored)
+        {
+            var ignored = new System.Collections.Generic.List<string>();
+
+            Assert.Equal(expected, LaunchCommandBuilder.ClaudeLaunchArgs(ticked, ignored));
+            Assert.Equal(expectedIgnored, string.Join(" ", ignored));
+        }
+
+        [Fact]
+        public void An_untouched_command_list_still_bypasses_after_the_settings_dialog_saves_it()
+        {
+            // The Settings dialog loads the built-in list and saves it back on any OK, so whatever the
+            // built-in list ticks becomes a fresh install's launch mode. (Lists saved before 452d33a4
+            // are not covered: they hold the old built-in, plain claude ticked.)
+            WithTempDir(dir =>
+            {
+                var settings = new SettingsService(dir);
+                Assert.Equal(LaunchCommandBuilder.BypassPermissionsArgs,
+                    LaunchCommandBuilder.ClaudeLaunchArgs(settings.GetDefaultClaudeCommand()?.Command));
+
+                settings.SetClaudeCommands(settings.GetClaudeCommands());
+
+                Assert.Equal(LaunchCommandBuilder.BypassPermissionsArgs,
+                    LaunchCommandBuilder.ClaudeLaunchArgs(new SettingsService(dir).GetDefaultClaudeCommand()?.Command));
+            });
+        }
+
         private static int CountOccurrences(string haystack, string needle)
         {
             int count = 0;

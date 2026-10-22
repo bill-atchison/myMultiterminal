@@ -137,8 +137,9 @@ claude --add-dir <mt-source> --settings <settings.local.json> --mcp-config <mcp.
 
 **Now** (what `LaunchCommandBuilder.BuildFlags` emits; checked against source 2026-09-29, ticket 0ff1b520 item 16):
 ```
-claude --plugin-dir '<plugin>' --mcp-config '<%APPDATA%\multiterminal\.mcp.json>' [--settings <forced statusline> --setting-sources 'user,project'] --dangerously-skip-permissions; exit
+claude --plugin-dir '<plugin>' --mcp-config '<%APPDATA%\multiterminal\.mcp.json>' [--settings <forced statusline> --setting-sources 'user,project'] [<arguments of the command ticked in Settings > Claude commands>]; exit
 ```
+The trailing arguments come from `LaunchCommandBuilder.ClaudeLaunchArgs` (task 452d33a4): plain `claude` adds none, so the user's own permission mode applies. Session and name flags (`-c`, `--resume`, `-n`, ...) are left out, and a tail with any character outside `[A-Za-z0-9_=.,:/@+-]` is left out entirely; both are logged. The built-in command list ticks `claude --dangerously-skip-permissions`, so a fresh install bypasses, as before. An install that saved Settings before this change stored the old built-in list (plain `claude` ticked) and now runs in the user's own permission mode until bypass is ticked again; it is not migrated.
 
 > ⚠️ The "Before" line above is history. Its `--channels server:multiterminal-channel` form is **not** what
 > MT emits, and Claude Code no longer resolves it (ClarionAssistant hit exactly this; GitHub #20). A plugin

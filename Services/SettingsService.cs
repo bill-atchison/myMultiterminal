@@ -1136,10 +1136,14 @@ namespace MultiTerminal.Services
 
             if (string.IsNullOrEmpty(data))
             {
-                // Return default commands if none configured
-                result.Add(new ClaudeCommand("claude", true));
+                // Built-in list. The bypass preset is the ticked one because Claude panes launch with
+                // the ticked command (task 452d33a4) and MT always bypassed before that; the Settings
+                // dialog saves this list on any OK, so whatever is ticked here becomes a fresh
+                // install's launch mode. Lists saved before 452d33a4 tick plain claude (the old
+                // built-in) and are not migrated.
+                result.Add(new ClaudeCommand("claude", false));
                 result.Add(new ClaudeCommand("claude -c", false));
-                result.Add(new ClaudeCommand("claude --dangerously-skip-permissions", false));
+                result.Add(new ClaudeCommand("claude --dangerously-skip-permissions", true));
                 return result;
             }
 
@@ -1156,8 +1160,8 @@ namespace MultiTerminal.Services
             }
             catch
             {
-                // Return defaults on parse error
-                result.Add(new ClaudeCommand("claude", true));
+                // Return defaults on parse error (bypass ticked, as in the built-in list above)
+                result.Add(new ClaudeCommand("claude --dangerously-skip-permissions", true));
             }
 
             return result;

@@ -48,7 +48,11 @@ namespace MultiTerminal.Services
             // which ConPtyTerminal.ApplySessionName needs to splice `-n '<name>'` in after.
             string resumeFlag = resumeId == null ? string.Empty : $" --resume {resumeId}";
 
-            string autoRunCommand = $"claude{flags}{resumeFlag} --dangerously-skip-permissions; exit";
+            var ignored = new List<string>();
+            string launchArgs = ClaudeLaunchArgs(_claudeCommandSource?.Invoke(), ignored);
+            if (ignored.Count > 0)
+                _log?.Warning("LaunchCommandBuilder", $"Ticked Claude command: ignored {string.Join(" ", ignored)} (see LaunchCommandBuilder.ClaudeLaunchArgs for what can be passed).");
+            string autoRunCommand = $"claude{flags}{resumeFlag}{launchArgs}; exit";
 
             return new LaunchCommand
             {
@@ -56,6 +60,88 @@ namespace MultiTerminal.Services
                 AutoRunCommand = autoRunCommand,
                 ProjectId = project?.Id
             };
+        }
+
+        /// <summary>The launch arguments used when no Claude command is ticked.</summary>
+        public const string BypassPermissionsArgs = " --dangerously-skip-permissions";
+
+        private static Func<string> _claudeCommandSource;
+
+        /// <summary>
+        /// Wires the Settings > Claude commands choice into every Claude pane launch, docked and
+        /// spawned (task 452d33a4). Read on each launch, so a change in Settings applies to the next
+        /// terminal. The built-in list (<see cref="SettingsService.GetClaudeCommands"/>) ticks the
+        /// bypass preset, so a fresh install keeps bypassing. An install that saved Settings before
+        /// this change stored the old built-in list, which ticked plain <c>claude</c>, so its panes
+        /// now run in the user's own <c>defaultMode</c> until bypass is ticked again (no migration:
+        /// a saved list cannot tell that default from a deliberate choice). Unset (tests, any other
+        /// host) keeps bypass.
+        /// </summary>
+        public static void SetClaudeCommandSource(Func<string> source) => _claudeCommandSource = source;
+
+        private static readonly HashSet<string> SessionSwitches = new HashSet<string>(StringComparer.Ordinal) { "-c", "--continue" };
+        private static readonly HashSet<string> SessionOptionsWithValue = new HashSet<string>(StringComparer.Ordinal) { "-r", "--resume", "--session-id", "-n", "--name" };
+        private static readonly System.Text.RegularExpressions.Regex PlainToken =
+            new System.Text.RegularExpressions.Regex(@"^[A-Za-z0-9_=.,:/+-][A-Za-z0-9_=.,:/@+-]*$");
+
+        /// <summary>
+        /// The arguments a ticked command adds after MT's own flags: the tokens after its leading
+        /// <c>claude</c>. Plain <c>claude</c> adds none, so the user's own <c>permissions.defaultMode</c>
+        /// applies. Nothing ticked (null/blank) gives <see cref="BypassPermissionsArgs"/>.
+        /// <para>What MT does not pass goes to <paramref name="ignored"/>, which the caller logs:</para>
+        /// <list type="bullet">
+        /// <item>A ticked command that does not start with <c>claude</c>: nothing is passed, not even
+        /// bypass, since silently picking the most permissive mode is not what the user chose.</item>
+        /// <item>A tail with any token outside <c>[A-Za-z0-9_=.,:/@+-]</c> (quotes, <c>;</c>, <c>$</c>,
+        /// <c>|</c>, <c>&amp;</c>, parentheses...) or starting with <c>@</c> (PowerShell splatting):
+        /// the whole tail. The arguments land unquoted in the
+        /// pane's PowerShell <c>-Command</c> line, so passing part of it could run a second statement
+        /// or split a quoted value.</item>
+        /// <item>The session flags <c>-c</c>/<c>--continue</c>/<c>-r</c>/<c>--resume</c>/<c>--session-id</c>
+        /// and the name flags <c>-n</c>/<c>--name</c>, with a following value, in <c>=</c> form, or
+        /// attached (<c>-nBob</c>): MT chooses the session (launch-session-choice.md: <c>--resume</c>,
+        /// never <c>--continue</c>, which can attach a helper to its PM's live session) and the name
+        /// (ConPtyTerminal.ApplySessionName).</item>
+        /// </list>
+        /// </summary>
+        public static string ClaudeLaunchArgs(string tickedCommand, ICollection<string> ignored = null)
+        {
+            var tokens = (tickedCommand ?? string.Empty)
+                .Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length == 0) return BypassPermissionsArgs;
+
+            if (!string.Equals(tokens[0], "claude", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(tokens[0], "claude.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                ignored?.Add(tickedCommand.Trim());
+                return string.Empty;
+            }
+
+            if (tokens.Skip(1).Any(t => !PlainToken.IsMatch(t)))
+            {
+                ignored?.Add(string.Join(" ", tokens.Skip(1)));
+                return string.Empty;
+            }
+
+            var args = new System.Text.StringBuilder();
+            for (int i = 1; i < tokens.Length; i++)
+            {
+                string t = tokens[i];
+                bool optionWithValue = SessionOptionsWithValue.Contains(t);
+                bool attachedShort = t.Length > 2 && (t.StartsWith("-n", StringComparison.Ordinal) || t.StartsWith("-r", StringComparison.Ordinal));
+                if (optionWithValue || attachedShort || SessionSwitches.Contains(t)
+                    || t.StartsWith("--resume=", StringComparison.Ordinal)
+                    || t.StartsWith("--session-id=", StringComparison.Ordinal)
+                    || t.StartsWith("--name=", StringComparison.Ordinal))
+                {
+                    ignored?.Add(t);
+                    if (optionWithValue && i + 1 < tokens.Length && !tokens[i + 1].StartsWith("-", StringComparison.Ordinal))
+                        ignored?.Add(tokens[++i]);
+                    continue;
+                }
+                args.Append(' ').Append(t);
+            }
+            return args.ToString();
         }
 
         /// <summary>
@@ -407,14 +493,12 @@ namespace MultiTerminal.Services
         /// <remarks>
         /// <para><b>Why set it at all.</b> Left unset, Claude Code decides per message from the two
         /// sessions' permission modes: a session that bypasses prompts HOLDS an inbound message
-        /// unless the sender attests the same class. Every MT terminal launches with bypass today,
-        /// so they match and messages auto-deliver — but that is an accident of uniform
-        /// configuration, not a guarantee. <c>AgentProcess.SpawnAsync</c> already takes a
-        /// <c>permissionMode</c> parameter that no caller overrides, and
-        /// <c>SettingsService.GetClaudeCommands</c> offers non-bypass presets behind a
-        /// <c>GetDefaultClaudeCommand()</c> with no callers. The moment either is wired up, traffic
-        /// between a prompting terminal and a bypass terminal is held in ONE direction, silently,
-        /// and the symptom reads as "nobody messaged me" — the worst shape a messaging bug can take.
+        /// unless the sender attests the same class. Since task 452d33a4 a pane runs the command
+        /// ticked in Settings (<see cref="SetClaudeCommandSource"/>), so panes need not share a mode,
+        /// while Oracle and headless <c>AgentProcess</c> agents still bypass. Without this setting,
+        /// traffic between a prompting terminal and a bypass terminal is held in ONE direction,
+        /// silently, and the symptom reads as "nobody messaged me" — the worst shape a messaging
+        /// bug can take.
         /// </para>
         /// <para><b>Why only when absent — and this is the load-bearing half.</b> The caller DROPS
         /// Claude Code's LOCAL source and re-supplies that file's keys here, at <c>--settings</c>
@@ -429,7 +513,7 @@ namespace MultiTerminal.Services
         /// <para><b>What this does NOT guarantee.</b> "accept" here is best-effort. Managed settings
         /// outrank it outright, and a repository's own tightening still wins — so a message can
         /// still be held despite this. The setting removes the silent-hold case MT actually causes
-        /// (its own uniform-bypass assumption); it does not make delivery certain.</para>
+        /// (panes in different permission modes); it does not make delivery certain.</para>
         /// <para><b>Naming debt, recorded rather than fixed here:</b> this key rides in the file
         /// <see cref="BuildForcedStatuslineFlag"/> writes, whose name now understates what it emits.
         /// Renaming is mechanical but touches OracleService and the launch tests, so it is left to
