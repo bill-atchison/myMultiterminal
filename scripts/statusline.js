@@ -1,17 +1,26 @@
 #!/usr/bin/env node
 // Claude Code statusLine script for MultiTerminal
 // Reads JSON from stdin (model, context-window fill, rate-limit/quota stats),
-// writes it to a temp file for the MultiTerminal status bar to pick up.
+// writes it to a temp file for the MultiTerminal status bar to pick up, then
+// prints the user's own statusLine (task 452d33a4): MT forces this script as the
+// statusLine of every terminal it launches, so without the hand-off Claude Code's
+// status line row stayed empty.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { spawn, spawnSync } = require('child_process');
 
 let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { input += chunk; });
 process.stdin.on('end', () => {
+    writeMtStats();
+    printUserStatusLine(input);
+});
+
+function writeMtStats() {
     try {
         const data = JSON.parse(input);
         const terminalName = process.env.MULTITERMINAL_NAME;
@@ -21,7 +30,7 @@ process.stdin.on('end', () => {
         // are required — docId scopes the output file so sibling terminals with
         // the same name can't clobber each other's statusline data.
         if (!terminalName || !docId) {
-            process.exit(0);
+            return;
         }
 
         const cwd = data.workspace?.current_dir || '';
@@ -128,7 +137,94 @@ process.stdin.on('end', () => {
     } catch {
         // Silently fail — don't break Claude Code
     }
-});
+}
+
+// Runs the statusLine the user configured in their own settings.json (the active
+// CLAUDE_CONFIG_DIR, else ~/.claude) with the same stdin, and prints its output.
+// Only the user level: MT's --settings outranks project settings for statusLine
+// anyway. Any failure prints nothing, which is what this script did before.
+function printUserStatusLine(stdinText) {
+    try {
+        if (process.env.MT_STATUSLINE_CHAINED) return; // never re-enter ourselves
+        const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+        const settings = JSON.parse(fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'));
+        const statusLine = settings && settings.statusLine;
+        const command = statusLine && statusLine.type === 'command' ? statusLine.command : null;
+        if (typeof command !== 'string' || !command.trim()) return;
+        if (normPath(command).includes(normPath(__filename))) return;
+
+        const shell = findShell();
+        if (!shell) return;
+        // coreutils `timeout` signals the command's whole process group. taskkill /T alone is
+        // not enough under Git Bash: its emulated fork gives a grandchild a parent outside the
+        // Windows process tree, so a hung command would leave an orphan behind on every render.
+        // The command travels in an env var, so no quoting of user text is needed.
+        //
+        // WHY 15s / 18s (not 4s / 6s). User statusLines often run git status. On a large dirty
+        // worktree that routinely takes 5–8s (measured ~6.5s for ca-statusline.sh on this machine).
+        // The earlier 4s kill always blanked the Claude console row — the bug that looked like
+        // "I lost the status line". A hung command still dies; a slow-but-live one finishes.
+        const child = spawn(shell, ['-c', 'if command -v timeout >/dev/null 2>&1; then exec timeout -k 1 15 bash -c "$MT_USER_STATUSLINE"; else exec bash -c "$MT_USER_STATUSLINE"; fi'], {
+            windowsHide: true,
+            stdio: ['pipe', 'pipe', 'ignore'],
+            env: { ...process.env, MT_STATUSLINE_CHAINED: '1', MT_USER_STATUSLINE: command }
+        });
+        let out = '';
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => { out += chunk; });
+        // A wall-clock deadline for the whole tree: killing bash alone leaves its children
+        // holding the output pipe open, so a spawnSync timeout never actually fires.
+        const timer = setTimeout(() => {
+            killTree(child.pid);
+            process.exit(0); // timed out: print nothing, not a partial line
+        }, 18000); // backstop only: `timeout -k 1 15` has normally ended it by 16s
+
+        child.on('error', () => clearTimeout(timer));
+        child.on('close', (code, signal) => {
+            clearTimeout(timer);
+            // 124/137: coreutils `timeout` expired (137 = it had to KILL). A partial line is not printed.
+            if (signal || code === 124 || code === 137) return;
+            if (out) process.stdout.write(out);
+        });
+        child.stdin.on('error', () => { /* the command may not read stdin */ });
+        child.stdin.end(stdinText);
+    } catch {
+        // No user statusLine, unreadable settings, or a failing command: print nothing.
+    }
+}
+
+function killTree(pid) {
+    try {
+        if (process.platform === 'win32') {
+            spawnSync('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true, stdio: 'ignore' });
+        } else {
+            process.kill(pid, 'SIGKILL');
+        }
+    } catch { /* already gone */ }
+}
+
+// Claude Code runs statusLine commands through Git Bash on Windows. A bare `bash`
+// is not good enough there: C:\Windows\System32\bash.exe is WSL, which cannot see
+// ~/.claude/... the way Git Bash does.
+function findShell() {
+    if (process.platform !== 'win32') return '/bin/sh';
+    const candidates = [];
+    if (process.env.CLAUDE_CODE_GIT_BASH_PATH) candidates.push(process.env.CLAUDE_CODE_GIT_BASH_PATH);
+    for (const dir of (process.env.PATH || '').split(';')) {
+        if (dir && fs.existsSync(path.join(dir, 'git.exe'))) {
+            candidates.push(path.join(dir, '..', 'bin', 'bash.exe'), path.join(dir, 'bash.exe'));
+        }
+    }
+    for (const root of [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs')]) {
+        if (root) candidates.push(path.join(root, 'Git', 'bin', 'bash.exe'));
+    }
+    const system32 = normPath(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32'));
+    return candidates.find((p) => !normPath(path.resolve(p)).startsWith(system32) && fs.existsSync(p)) || null;
+}
+
+function normPath(s) {
+    return s.replace(/\\/g, '/').toLowerCase();
+}
 
 // Synchronous sleep without a busy-spin (this is a one-shot CLI process, so
 // blocking the main thread briefly is fine and we have no event loop to yield to).

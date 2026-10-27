@@ -150,7 +150,7 @@ claude --plugin-dir '<plugin>' --mcp-config '<%APPDATA%\multiterminal\.mcp.json>
 - `--add-dir` removed: Plugin provides CLAUDE.md; project has its own
 - `--plugin-dir` added: loads the MT plugin (hooks, skills, agents, CLAUDE.md) into MT terminals only
 - `--mcp-config` kept: Centralized MCP server registration at `%APPDATA%\multiterminal\.mcp.json`. The app heals that file at startup and again at launch if it is missing (`Services/CentralMcpConfig.cs`); before task cb4883b6, nothing wrote it on an installed machine (GitHub #8)
-- `--settings` is back, for a different purpose: it forces MT's statusline over a project's own (tasks 72444250, 1ba59334), not hook wiring
+- `--settings` is back, for a different purpose: it forces MT's statusline over a project's own (tasks 72444250, 1ba59334), not hook wiring. The forced `scripts/statusline.js` still writes `mt-statusline-*.json` for the pane header, then runs the user's own `statusLine` command from `~/.claude/settings.json` (or `CLAUDE_CONFIG_DIR`) and prints its stdout so the Claude console row is not blank (task 452d33a4)
 
 ---
 
