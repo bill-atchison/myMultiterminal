@@ -112,9 +112,90 @@ namespace MultiTerminal.Dialogs
             LoadProfileSummary();
             LoadMultiConnect();
             LoadClaudeProfiles();
+            LoadPluginVersion();
 
             // Source control accounts manager is only available when its service is injected.
             ManageSourceControlAccountsButton.IsEnabled = _sourceControlAccountService != null;
+        }
+
+        // -------- MultiTerminal plugin (task 4dc459e4) --------
+        // The last check's result: "Update now" installs exactly the commit it reported.
+        private PluginCheckResult _pluginCheck;
+        private bool _pluginBusy;
+
+        private void LoadPluginVersion()
+        {
+            using var updater = new PluginUpdateService();
+            string root = updater.ResolveMarketplaceRoot();
+            PluginVersionText.Text = root == null
+                ? "MultiTerminal plugin: not found"
+                : "MultiTerminal plugin: " + PluginUpdateService.DescribeInstalled(PluginUpdateService.ReadStamp(root));
+            PluginVersionText.ToolTip = root;
+            SetPluginButtons();
+        }
+
+        private void SetPluginButtons()
+        {
+            PluginCheckButton.IsEnabled = !_pluginBusy;
+            PluginUpdateButton.IsEnabled = !_pluginBusy && _pluginCheck?.CanUpdate == true;
+            // SmallActionButton's template does not grey a disabled button.
+            PluginCheckButton.Opacity = PluginCheckButton.IsEnabled ? 1.0 : 0.5;
+            PluginUpdateButton.Opacity = PluginUpdateButton.IsEnabled ? 1.0 : 0.5;
+        }
+
+        private async void PluginCheckButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_pluginBusy) return;
+            _pluginBusy = true;
+            _pluginCheck = null;
+            PluginStatusText.Text = "Checking GitHub…";
+            SetPluginButtons();
+            try
+            {
+                _pluginCheck = await Task.Run(async () =>
+                {
+                    using var updater = new PluginUpdateService();
+                    return await updater.CheckAsync().ConfigureAwait(false);
+                });
+                PluginStatusText.Text = PluginUpdateService.DescribeCheck(_pluginCheck);
+            }
+            catch (Exception ex)
+            {
+                PluginStatusText.Text = "Check failed: " + ex.Message;
+            }
+            finally
+            {
+                _pluginBusy = false;
+                LoadPluginVersion();
+            }
+        }
+
+        private async void PluginUpdateButton_Click(object sender, RoutedEventArgs e)
+        {
+            var check = _pluginCheck;
+            if (_pluginBusy || check?.CanUpdate != true) return;
+            _pluginBusy = true;
+            PluginStatusText.Text = "Downloading and installing " + check.Latest.Sha.Substring(0, 7) + "…";
+            SetPluginButtons();
+            try
+            {
+                var result = await Task.Run(async () =>
+                {
+                    using var updater = new PluginUpdateService();
+                    return await updater.UpdateAsync(check).ConfigureAwait(false);
+                });
+                PluginStatusText.Text = result.Message;
+                if (result.Success) _pluginCheck = null;
+            }
+            catch (Exception ex)
+            {
+                PluginStatusText.Text = "The update failed: " + ex.Message;
+            }
+            finally
+            {
+                _pluginBusy = false;
+                LoadPluginVersion();
+            }
         }
 
         private void PopulateComboBoxes()
@@ -158,6 +239,49 @@ namespace MultiTerminal.Dialogs
             HomeViewCombo.Items.Add("Project list (Browse All)");
             HomeViewCombo.Items.Add("Project cards");
             HomeViewCombo.SelectedIndex = 0;
+
+            // Claude models (ticket b0d2f090): the aliases, Claude Code's default, and a typed name.
+            foreach (var combo in new[] { ProjectModelCombo, HelperModelCombo, SubagentModelCombo })
+            {
+                foreach (var item in ClaudeModelChoices.BuildSettingsPick(null, "opus").Items)
+                    combo.Items.Add(item);
+                combo.SelectedIndex = 0;
+            }
+        }
+
+        private void ModelCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (sender == ProjectModelCombo) ShowModelText(ProjectModelCombo, ProjectModelText);
+            else if (sender == HelperModelCombo) ShowModelText(HelperModelCombo, HelperModelText);
+            else if (sender == SubagentModelCombo) ShowModelText(SubagentModelCombo, SubagentModelText);
+        }
+
+        private static void ShowModelText(ComboBox combo, TextBox text) =>
+            text.Visibility = ClaudeModelChoices.IsOtherIndex(combo.SelectedIndex) ? Visibility.Visible : Visibility.Collapsed;
+
+        private static void LoadModelPick(ComboBox combo, TextBox text, string stored, string builtIn)
+        {
+            var pick = ClaudeModelChoices.BuildSettingsPick(stored, builtIn);
+            combo.SelectedIndex = pick.SelectedIndex;
+            text.Text = pick.CustomText;
+            ShowModelText(combo, text);
+        }
+
+        // Validates the three model picks; on success returns the values to store. A message and false otherwise.
+        private bool TryReadModelSettings(out string project, out string helper, out string subagent)
+        {
+            project = helper = subagent = null;
+            return TryReadModelPick("Project model", ProjectModelCombo, ProjectModelText, out project)
+                && TryReadModelPick("Helper model", HelperModelCombo, HelperModelText, out helper)
+                && TryReadModelPick("Subagent model", SubagentModelCombo, SubagentModelText, out subagent);
+        }
+
+        private bool TryReadModelPick(string label, ComboBox combo, TextBox text, out string value)
+        {
+            if (ClaudeModelChoices.TryResolveSettingsPick(combo.SelectedIndex, text.Text, out value, out string error))
+                return true;
+            MessageBox.Show(this, $"{label}: {error}", "Claude models", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return false;
         }
 
         // The Home view combo's items in index order (ticket e20e2ce0 item 8).
@@ -200,6 +324,11 @@ namespace MultiTerminal.Dialogs
             HomeViewCombo.SelectedIndex = Math.Max(0, Array.IndexOf(HomeViewChoice, _settings.GetStartScreenHomeView()));
             ConfirmExitCheck.IsChecked = _settings.GetConfirmExit();
 
+            var models = _settings.GetClaudeModelSettings();
+            LoadModelPick(ProjectModelCombo, ProjectModelText, models.GlobalProjectModel, ClaudeModelLaunchPolicy.BuiltInProjectModel);
+            LoadModelPick(HelperModelCombo, HelperModelText, models.GlobalHelperModel, ClaudeModelLaunchPolicy.BuiltInHelperModel);
+            LoadModelPick(SubagentModelCombo, SubagentModelText, models.GlobalSubagentModel, ClaudeModelLaunchPolicy.BuiltInSubagentModel);
+
             // Git: per-task worktree isolation
             WorktreeModeCheck.IsChecked = string.Equals(
                 _settings.GetWorktreeMode(), SettingsService.WorktreeModeOn,
@@ -231,6 +360,10 @@ namespace MultiTerminal.Dialogs
                 CodexEffortCombo.SelectedIndex = 0;
         }
 
+        private string _modelsToSaveProject;
+        private string _modelsToSaveHelper;
+        private string _modelsToSaveSubagent;
+
         private void SaveSettings()
         {
             _settings.BeginBatch();
@@ -250,6 +383,7 @@ namespace MultiTerminal.Dialogs
                 _settings.SetDefaultWorkingDirectory(DefaultWorkingDirText.Text?.Trim());
                 _settings.SetStartScreenHomeView(HomeViewChoice[Math.Max(0, HomeViewCombo.SelectedIndex)]);
                 _settings.SetConfirmExit(ConfirmExitCheck.IsChecked == true);
+                _settings.SetClaudeModelSettings(_modelsToSaveProject, _modelsToSaveHelper, _modelsToSaveSubagent);
 
                 _settings.SetWorktreeMode(
                     WorktreeModeCheck.IsChecked == true
@@ -619,6 +753,10 @@ namespace MultiTerminal.Dialogs
             }
 
             if (!ValidateClaudeProfiles())
+                return;
+
+            // Validated before anything is written, like the checks above, and kept for SaveSettings.
+            if (!TryReadModelSettings(out _modelsToSaveProject, out _modelsToSaveHelper, out _modelsToSaveSubagent))
                 return;
 
             SaveSettings();

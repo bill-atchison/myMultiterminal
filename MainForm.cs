@@ -268,6 +268,16 @@ namespace MultiTerminal
             _companionManager = _mcpServer.CompanionProcessManager;
             _ = System.Threading.Tasks.Task.Run(() => _companionManager.StartAll());
 
+            // Run once at startup, off the UI thread, and never touch the real app-data folder in tests.
+            if (!ProductionDataGuard.IsUnderTestHost())
+            {
+                _ = System.Threading.Tasks.Task.Run(() =>
+                    LaunchCommandBuilder.SweepStaleForcedStatuslineTempFiles(
+                        LaunchCommandBuilder.GetForcedStatuslineDirectory(),
+                        TimeSpan.FromHours(1),
+                        DateTime.UtcNow));
+            }
+
             // Defer RestoreSession to after the form is shown to avoid blocking the constructor
             // This prevents WebView2 initialization from blocking the UI thread during startup
             _debugLogService?.Trace("MainForm", "Deferring RestoreSession until form is shown...");
@@ -429,6 +439,40 @@ namespace MultiTerminal
             }
         }
 
+        /// <summary>
+        /// The quiet plugin check (task 4dc459e4): three minutes after startup, at most once a day, posts one
+        /// Inbox notice to the Owner when GitHub main has a newer plugin. Never installs; the Owner does that
+        /// from Settings. <c>MULTITERMINAL_PLUGIN_UPDATE_CHECK=0</c> turns it off.
+        /// </summary>
+        private void StartPluginUpdateCheck()
+        {
+            var broker = _mcpServer?.Broker;
+            var settings = _settings;
+            if (broker == null || settings == null) return;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(3)).ConfigureAwait(false);
+                    using var updater = new Services.PluginUpdateService { Log = m => _debugLogService?.Warning("PluginUpdate", m) };
+                    await updater.RunStartupCheckAsync(
+                        settings,
+                        postNotice: text =>
+                        {
+                            string owner = broker.DefaultInboxRecipient;
+                            return !string.IsNullOrEmpty(owner)
+                                && broker.CreateInboxNotification(owner, null, null, null, null,
+                                    Services.PluginUpdateService.InboxType, text, Services.PluginUpdateService.SenderName)?.Success == true;
+                        },
+                        log: message => _debugLogService?.Info("PluginUpdate", message)).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _debugLogService?.Error("PluginUpdate", $"Startup check failed: {ex.Message}");
+                }
+            });
+        }
+
         private Services.GitHubWatchService _gitHubWatch;
 
         /// <summary>
@@ -482,6 +526,8 @@ namespace MultiTerminal
 #pragma warning restore CA2000
                 // Task e4924065. The service raises these on a pool thread; panes are UI objects.
                 _gitHubWatch.CountsChanged += projectId => PostGitHubUi(() => RefreshGitHubBands(projectId));
+                // Task 81d0e597: a failed check shows (and the next good one clears) without waiting for a tick.
+                _gitHubWatch.CheckRecorded += projectId => PostGitHubUi(() => RefreshGitHubBands(projectId));
                 _gitHubWatch.NoticesQueued += projectId => PostGitHubUi(() => DeliverGitHubNotices(projectId));
                 // Each tick also refreshes the bands: PATCH /api/projects/{id} and update_project change
                 // the Repository URL without any event MainForm hears (pipeline Run 1), so a REST or MCP
@@ -516,8 +562,10 @@ namespace MultiTerminal
         /// <summary>
         /// Shows each terminal's GitHub band (task e4924065): the repo of the project the pane belongs
         /// to (<see cref="TerminalDocument.SettingsProjectId"/>), with the open issue and PR counts
-        /// while that project is watched. A pane outside any project, or in one with no github.com
-        /// repo, has no band. <paramref name="onlyProjectId"/> limits it to one project's panes.
+        /// while that project is watched, and the last check's failure if it failed (task 81d0e597,
+        /// decided by <see cref="Services.GitHubBandModel.Build"/>). A pane outside any project, or in
+        /// one with no github.com repo, has no band. <paramref name="onlyProjectId"/> limits it to one
+        /// project's panes.
         /// </summary>
         private void RefreshGitHubBands(string onlyProjectId)
         {
@@ -526,7 +574,7 @@ namespace MultiTerminal
                 var db = _sharedProjectDatabase;
                 if (db == null || _dockPanel == null) return;
 
-                var bands = new Dictionary<string, (string Repo, int? Issues, int? Prs)>(StringComparer.Ordinal);
+                var bands = new Dictionary<string, Services.GitHubBand>(StringComparer.Ordinal);
                 foreach (var doc in _dockPanel.Contents.OfType<TerminalDocument>())
                 {
                     if (doc == null || doc.IsDisposed) continue;
@@ -534,7 +582,7 @@ namespace MultiTerminal
                     if (onlyProjectId != null && !string.Equals(projectId, onlyProjectId, StringComparison.Ordinal)) continue;
                     if (string.IsNullOrEmpty(projectId))
                     {
-                        doc.SetGitHubBand(null, null, null);
+                        doc.SetGitHubBand(Services.GitHubBand.Hidden);
                         continue;
                     }
 
@@ -542,18 +590,13 @@ namespace MultiTerminal
                     {
                         var project = db.GetRichProject(projectId);
                         var repo = Services.GitHubRepoRef.TryParse(project?.GitRepoUrl);
-                        if (repo == null)
-                            band = (null, null, null);
-                        else if (project.GitHubWatchMode == GitHubWatchMode.Off)
-                            band = (repo.FullName, null, null);   // the link without counts nobody refreshes
-                        else
-                        {
-                            var state = db.GetGitHubWatchState(projectId, repo.FullName);
-                            band = (repo.FullName, state.OpenIssues, state.OpenPullRequests);
-                        }
+                        // Watching off: the link without counts nobody refreshes, and no failure.
+                        bool watching = repo != null && project.GitHubWatchMode != GitHubWatchMode.Off;
+                        band = Services.GitHubBandModel.Build(repo?.FullName, watching,
+                            watching ? db.GetGitHubWatchState(projectId, repo.FullName) : null);
                         bands[projectId] = band;
                     }
-                    doc.SetGitHubBand(band.Repo, band.Issues, band.Prs);
+                    doc.SetGitHubBand(band);
                 }
             }
             catch (Exception ex)
@@ -564,12 +607,30 @@ namespace MultiTerminal
 
         /// <summary>
         /// Opens the page a GitHub band link names (task e4924065). The URL is built here from the
-        /// project's own repo; the header only says which of the three pages.
+        /// project's own repo; the header only says which of the three pages. The failure link (task
+        /// 81d0e597) names one of two MT forms instead: Source Control Accounts (the dialog Settings'
+        /// own button opens; Settings is one page with no tabs to open it on) or the project settings.
         /// </summary>
         private void OnPaneGitHubLinkRequested(object sender, GitHubLinkRequestedEventArgs e)
         {
             try
             {
+                if (e.Target == Services.GitHubBandModel.AccountsTarget)
+                {
+                    if (_sourceControlAccountService == null) return;
+                    var accounts = new SourceControlAccountsDialog(_sourceControlAccountService);
+                    new WindowInteropHelper(accounts) { Owner = this.Handle };
+                    accounts.ShowDialog();
+                    // A fixed token is used at the next check; show the band's state as it is now.
+                    RefreshGitHubBands(e.ProjectId);
+                    return;
+                }
+                if (e.Target == Services.GitHubBandModel.ProjectTarget)
+                {
+                    OpenProjectSettings(e.ProjectId);
+                    return;
+                }
+
                 var project = _sharedProjectDatabase?.GetRichProject(e.ProjectId);
                 string url = Services.GitHubRepoRef.TryParse(project?.GitRepoUrl)?.WebUrl(e.Target);
                 if (url == null) return;
@@ -924,6 +985,16 @@ namespace MultiTerminal
             // Claude panes run the command ticked in Settings > Claude commands (452d33a4).
             Services.LaunchCommandBuilder.SetClaudeCommandSource(
                 () => Services.SettingsService.Default.GetDefaultClaudeCommand()?.Command);
+
+            // Task 4dc459e4: repair a plugin update interrupted between its two renames, before anything can
+            // launch a terminal (with the shared root missing, GetMtPluginPath would fall through to the
+            // default location). On the UI thread on purpose: a background run could race the first launch,
+            // and the normal case is a few existence checks; only a real repair moves a folder. A root another
+            // MultiTerminal is updating is skipped after at most StartupReconcileLockWait.
+            Services.PluginUpdateService.ReconcileRoots(LaunchCommandBuilder.ExpectedMtPluginPaths,
+                Services.PluginUpdateService.RealSwapFileSystem.Instance,
+                m => _debugLogService?.Warning("PluginUpdate", m),
+                Services.PluginUpdateService.StartupReconcileLockWait);
 
             // Initialize McpConfigService — used by the project settings form's Sync MCP config and at launch
             // Pass debug log callback so CLI errors are visible in the debug panel
@@ -1451,6 +1522,9 @@ namespace MultiTerminal
 
                         // Checks projects' GitHub repos for new issues and PRs (task 92eeeb47).
                         StartGitHubWatch();
+
+                        // Once a day, asks GitHub whether a newer MultiTerminal plugin exists (task 4dc459e4).
+                        StartPluginUpdateCheck();
 
                         // Wire terminal stream resolver: resolves any terminal identifier
                         // (terminal ID, DocId, or agent name) to its ConPtyTerminal instance
@@ -2483,11 +2557,20 @@ namespace MultiTerminal
             string workingDir,
             string initialPrompt,
             string spawnerName,
-            string spawnerDocId)
+            string spawnerDocId,
+            string requestedModel)
         {
             try
             {
                 _debugLogService?.Info("MainForm", $"Spawn requested: {agentName} ({agentType}) in {workingDir}");
+
+                // A model name from the spawner goes onto a command line (ticket b0d2f090): refuse an invalid one
+                // before anything is created, whatever route the request came by.
+                {
+                    string askedModel = ClaudeModelLaunchPolicy.Normalize(requestedModel);
+                    if (askedModel != null && !ClaudeModelLaunchPolicy.IsDefaultToken(askedModel) && !ClaudeModelLaunchPolicy.IsValidModelName(askedModel))
+                        return (false, null, "model is not a valid model name (letters, digits, dots and hyphens, with an optional [1m] suffix). No pane was created.", null);
+                }
 
                 // Oracle is always-on — reject spawn requests, it's managed by OracleService
                 if (agentName.Equals(OracleService.OracleName, StringComparison.OrdinalIgnoreCase))
@@ -2575,7 +2658,8 @@ namespace MultiTerminal
                         // would run under --dangerously-skip-permissions with that project's local
                         // hooks/deny silently stripped (the fail-closed case BuildForcedStatuslineFlag
                         // documents).
-                        var launchCmd = Services.LaunchCommandBuilder.BuildCommand(kind, project, workingDirectory: workingDir);
+                        var spawnModel = DecideLaunchClaudeModel(ClaudeModelRole.Helper, project?.Id, workingDir, requestedModel, $"helper '{agentName}'");
+                        var launchCmd = Services.LaunchCommandBuilder.BuildCommand(kind, project, workingDirectory: workingDir, model: spawnModel.Model);
                         if (!string.IsNullOrEmpty(launchCmd.BootstrapError))
                         {
                             // Not HandleBootstrapErrorIfAny: that shows a modal MessageBox, which
@@ -2643,7 +2727,8 @@ namespace MultiTerminal
                             inheritedClaudeProfileName: spawnerProfileName,
                             onClaudeProfileRefused: refusal => profileRefusal = refusal,
                             launchKind: Services.PaneLaunchKind.From(kind),
-                            yieldFocusToTyping: true);
+                            yieldFocusToTyping: true,
+                            subagentModel: kind == Models.TerminalKind.ClaudeCode ? spawnModel.SubagentModel : null);
 
                         // Task 7d20e94c: the helper's launch row points at the launch its PROVEN spawner
                         // pane is running (spawnerDocId comes from the caller's launch nonce, never from
@@ -2887,8 +2972,36 @@ namespace MultiTerminal
                     var agent = new AgentProcess();
                     pending = agent;
 
+                    // Ticket f4992532: the writer runs with --input-format stream-json, so after its
+                    // turn it waits on stdin forever. Stop it when the turn ends (the stream's
+                    // `result` message), or at the time limit if it hangs. The gate makes the stop
+                    // happen once, whichever fires first.
+                    var stopGate = new GlossWriterStopGate();
+
+                    void StopWriter(string reason)
+                    {
+                        if (!stopGate.TryClaimStop()) return;
+                        _debugLogService?.Info("GlossBackfill", $"Stopping gloss writer for {taskId}: {reason}.");
+                        // Task.Run: the turn-end message arrives on the stdout reader thread, and
+                        // StopAsync awaits that same reader task, so it must not run inline there.
+                        _ = Task.Run(async () =>
+                        {
+                            try { await agent.StopAsync(); }
+                            catch (Exception ex)
+                            {
+                                _debugLogService?.Warning("GlossBackfill", $"Stopping gloss writer for {taskId} failed: {ex.Message}");
+                            }
+                        });
+                    }
+
+                    agent.MessageReceived += (_, msg) =>
+                    {
+                        if (GlossWriterStopGate.IsTurnEnd(msg)) StopWriter("turn ended");
+                    };
+
                     agent.ProcessExited += (_, exitCode) =>
                     {
+                        stopGate.TryClaimStop();   // exited on its own or by a stop: the backstop must not touch a disposed agent
                         _debugLogService?.Info("GlossBackfill", $"Gloss writer for {taskId} exited ({exitCode}).");
                         try { agent.Dispose(); } catch { /* teardown is best-effort */ }
                     };
@@ -2900,10 +3013,21 @@ namespace MultiTerminal
                         prompt: prompt,
                         workingDir: AppDomain.CurrentDomain.BaseDirectory,
                         mcpConfigPath: mcpConfigPath,
-                        extraArgs: new[] { "--no-session-persistence" },
+                        extraArgs: new[] { "--model", "haiku", "--no-session-persistence" },
                         claudeProfile: glossProfile.Profile);
 
                     pending = null;   // the exit handler owns it from here
+
+                    // Backstop. No CancellationTokenSource (see CLAUDE.md): after a normal exit the
+                    // delay just runs out and finds the gate already claimed.
+                    _ = Task.Delay(GlossWriterStopGate.BackstopMs).ContinueWith(
+                        _ =>
+                        {
+                            if (!stopGate.StopClaimed)
+                                _debugLogService?.Warning("GlossBackfill", $"Gloss writer for {taskId} still running after {GlossWriterStopGate.BackstopMs / 60000} minutes; treating it as hung.");
+                            StopWriter("time limit reached");
+                        },
+                        TaskScheduler.Default);
                 }
                 finally
                 {
@@ -2984,13 +3108,16 @@ namespace MultiTerminal
                 if (!agentProfile.CanLaunch)
                     return (false, null, agentProfile.Refusal);
 
+                var agentModel = DecideLaunchClaudeModel(ClaudeModelRole.Helper, null, workingDir, null, $"headless agent '{agentName}'");
                 var agent = new AgentProcess();
                 await agent.SpawnAsync(
                     prompt: initialPrompt,
                     workingDir: workingDir,
                     mcpConfigPath: mcpConfigPath,
                     environmentVars: spawnEnv,
-                    claudeProfile: agentProfile.Profile);
+                    claudeProfile: agentProfile.Profile,
+                    model: agentModel.Model,
+                    subagentModel: agentModel.SubagentModel);
 
                 // Register with MessageBroker so other terminals can message this agent.
                 //
@@ -4355,7 +4482,7 @@ namespace MultiTerminal
         /// behalf (spawn_helper, helpers resumed with their PM). Focus then stays in the pane the Owner is
         /// typing in (<see cref="Services.PaneFocusGuard.ShouldKeepFocus"/>).</para>
         /// </summary>
-        public (string Name, string DocId) AddNewTerminal(string workingDirectory = null, float? fontSize = null, bool forceTabMode = false, string identityName = null, string autoRunCommand = null, string spawnerName = null, string projectId = null, bool isTeamLead = false, string gatewayProfile = null, bool atomicIdentityUniqueness = false, bool failClosedIdentity = false, Models.ClaudeProfile decidedClaudeProfile = null, string inheritedClaudeProfileName = null, Action<string> onClaudeProfileRefused = null, string resumeSessionId = null, bool pinWorkingDirectory = false, string launchKind = null, bool yieldFocusToTyping = false)
+        public (string Name, string DocId) AddNewTerminal(string workingDirectory = null, float? fontSize = null, bool forceTabMode = false, string identityName = null, string autoRunCommand = null, string spawnerName = null, string projectId = null, bool isTeamLead = false, string gatewayProfile = null, bool atomicIdentityUniqueness = false, bool failClosedIdentity = false, Models.ClaudeProfile decidedClaudeProfile = null, string inheritedClaudeProfileName = null, Action<string> onClaudeProfileRefused = null, string resumeSessionId = null, bool pinWorkingDirectory = false, string launchKind = null, bool yieldFocusToTyping = false, string subagentModel = null)
         {
             _debugLogService?.Trace("AddNewTerminal", "===== START =====");
 
@@ -4580,7 +4707,7 @@ namespace MultiTerminal
 
                 if (claudeProfileRefusal == null)
                 {
-                    doc.StartTerminal(dir, terminalName, autoRunCommand, spawnerName, projectId, isTeamLead, gatewayProfile, taskWorktreePath, claudeProfile: claudeProfile, resumeSessionId: resumeSessionId, launchKind: launchKind);
+                    doc.StartTerminal(dir, terminalName, autoRunCommand, spawnerName, projectId, isTeamLead, gatewayProfile, taskWorktreePath, claudeProfile: claudeProfile, resumeSessionId: resumeSessionId, launchKind: launchKind, subagentModel: subagentModel);
                     _debugLogService?.Trace("AddNewTerminal", "doc.StartTerminal returned");
                 }
                 else
@@ -4818,6 +4945,19 @@ namespace MultiTerminal
                     _debugLogService?.Warning("MainForm", $"#PROJ# [MainForm.OnStartScreenProjectLaunched] *** ID MISMATCH *** requested='{e.ProjectId}' returned='{project.Id}' name='{project.Name}'");
                 }
 
+                // GitHub #95: the project may already be open in another pane. Asked first, before the
+                // profile, the session choice or anything registered, so Switch and Cancel change nothing.
+                // After Switch the launching pane is left as it is (still on its start screen): sending it
+                // Home again would refocus its window over the pane just brought forward.
+                var alreadyOpen = ConfirmLaunchWhenProjectAlreadyOpen(doc, project);
+                if (alreadyOpen == AlreadyOpenAnswer.Cancelled)
+                {
+                    doc.ShowStartScreen();
+                    return;
+                }
+                if (alreadyOpen == AlreadyOpenAnswer.Switched)
+                    return;
+
                 // Claude profile (ticket c8ee0eec): the chosen card's project profile, read from the
                 // database, never one the pane ran under before. Decided before anything is stamped,
                 // built or registered, so a refused launch changes nothing.
@@ -4895,9 +5035,12 @@ namespace MultiTerminal
                 // ~/.codex/config.toml + writes the launcher scaffolding as a side-effect.
                 // A resume starts in the session's own last cwd (the flags depend on it) with
                 // --resume <id>; the command builder validates the id as a GUID.
+                // The model is the configured one for a resume too (Owner decision 2026-11-03): a resumed session
+                // would otherwise keep the model stored in its transcript.
+                var projectModel = DecideLaunchClaudeModel(ClaudeModelRole.ProjectPane, project.Id, null, null, $"project '{project.Name}'");
                 var launchCmd = resumeSession == null
-                    ? Services.LaunchCommandBuilder.BuildCommand(kind, project)
-                    : Services.LaunchCommandBuilder.BuildCommand(kind, project, resumeCwd, resumeSession.Entry.SessionId);
+                    ? Services.LaunchCommandBuilder.BuildCommand(kind, project, model: projectModel.Model)
+                    : Services.LaunchCommandBuilder.BuildCommand(kind, project, resumeCwd, resumeSession.Entry.SessionId, projectModel.Model);
 
                 // Bootstrap gate — see HandleBootstrapErrorIfAny for rationale.
                 if (HandleBootstrapErrorIfAny(launchCmd, onBeforeDialog: () => doc.ShowStartScreen()))
@@ -5067,7 +5210,8 @@ namespace MultiTerminal
                 _debugLogService?.Trace("StartScreen", $"Launching project '{project.Name}' in {launchDir}{(resumeSession == null ? string.Empty : $" resuming session {resumeSession.Entry.SessionId}")}");
                 _debugLogService?.Trace("MainForm", $"#PROJ# [MainForm.OnStartScreenProjectLaunched] Calling doc.StartTerminal: doc.DocId='{doc.DocId}' launchDir='{launchDir}' terminalName='{terminalName}' projectId='{project.Id}' projectName='{project.Name}' isTeamLead={isTeamLead} taskWorktreePath='{taskWorktreePath ?? "null"}'");
                 doc.StartTerminal(launchDir, terminalName, autoRunCommand, projectId: project.Id, isTeamLead: isTeamLead, gatewayProfile: gatewayProfile, taskWorktreePath: taskWorktreePath, claudeProfile: claudeProfile,
-                    resumeSessionId: resumeSession?.Entry.SessionId, launchKind: Services.PaneLaunchKind.From(kind));
+                    resumeSessionId: resumeSession?.Entry.SessionId, launchKind: Services.PaneLaunchKind.From(kind),
+                    subagentModel: kind == TerminalKind.ClaudeCode ? projectModel.SubagentModel : null);
                 _debugLogService?.Trace("MainForm", $"#PROJ# [MainForm.OnStartScreenProjectLaunched] After StartTerminal: doc.CustomTitle='{doc.CustomTitle}' doc.TabText='{doc.TabText}' doc.Text='{doc.Text}'");
 
                 doc.Activate();
@@ -5087,6 +5231,104 @@ namespace MultiTerminal
                 doc.ShowStartScreen(); // Restore start screen so the tab isn't blank
                 MessageBox.Show($"Failed to launch project: {ex.Message}", "Launch Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        /// <summary>The answer to <see cref="ConfirmLaunchWhenProjectAlreadyOpen"/>.</summary>
+        private enum AlreadyOpenAnswer
+        {
+            /// <summary>Not open elsewhere, or the Owner chose Open another: go on launching.</summary>
+            Launch,
+
+            /// <summary>The existing pane was brought forward. Leave the launching pane exactly as it is:
+            /// sending it back to its start screen would refocus its window over the one just raised.</summary>
+            Switched,
+
+            /// <summary>Cancel: launch nothing.</summary>
+            Cancelled,
+        }
+
+        /// <summary>
+        /// GitHub #95: when <paramref name="project"/> is already open in another of the Owner's PM panes,
+        /// asks whether to switch to it or open another. Not asked with Shift held (Shift means "launch, no
+        /// questions", as for the session choice) or for a pane the startup restore already chose for.
+        /// </summary>
+        private AlreadyOpenAnswer ConfirmLaunchWhenProjectAlreadyOpen(TerminalDocument doc, Models.Project project)
+        {
+            if ((Control.ModifierKeys & Keys.Shift) == Keys.Shift || _presetLaunchChoices.ContainsKey(doc.DocId))
+                return AlreadyOpenAnswer.Launch;
+
+            var open = FindPanesWithProjectOpen(project.Id, doc.DocId, out var panes);
+            if (open.Count == 0)
+                return AlreadyOpenAnswer.Launch;
+
+            var target = panes.First(d => d.DocId == open[0].DocId);
+            bool floating = target.DockState == DockState.Float;
+
+            var switchTo = new TaskDialogCommandLinkButton("Switch to it", $"Bring \"{open[0].Title}\" to the front.");
+            var another = new TaskDialogCommandLinkButton("Open another", "Launch a second pane on this project anyway.");
+            var cancel = TaskDialogButton.Cancel;
+            var page = new TaskDialogPage
+            {
+                Caption = "Project already open",
+                Heading = $"{project.Name} is already open",
+                Text = ProjectAlreadyOpen.Describe(open, floating),
+                Icon = TaskDialogIcon.Information,
+                AllowCancel = true,
+                DefaultButton = switchTo,
+            };
+            page.Buttons.Add(switchTo);
+            page.Buttons.Add(another);
+            page.Buttons.Add(cancel);
+
+            var choice = TaskDialog.ShowDialog(this, page);
+            _debugLogService?.Info("MainForm", $"Project '{project.Name}' already open in '{open[0].Title}' ({open.Count} pane(s)): {(choice == switchTo ? "switch" : choice == another ? "open another" : "cancel")}");
+
+            if (choice == another)
+                return AlreadyOpenAnswer.Launch;
+            if (choice != switchTo)
+                return AlreadyOpenAnswer.Cancelled;
+
+            // The question was modal: the pane may have closed or gone back to Home meanwhile. Switch to
+            // whichever pane still has the project open; if none does, there is nothing to switch to.
+            var stillOpen = FindPanesWithProjectOpen(project.Id, doc.DocId, out var panesNow);
+            if (stillOpen.Count == 0)
+                return AlreadyOpenAnswer.Cancelled;
+            BringPaneToFront(panesNow.First(d => d.DocId == stillOpen[0].DocId));
+            return AlreadyOpenAnswer.Switched;
+        }
+
+        /// <summary>The panes other than <paramref name="launchingDocId"/> that have the project open
+        /// (<see cref="ProjectAlreadyOpen.FindOpenPanes"/>), and every live pane they were picked from.
+        /// <c>DockPanel.Contents</c> includes floating, auto-hidden and hidden panes.</summary>
+        private IReadOnlyList<OpenPaneFacts> FindPanesWithProjectOpen(string projectId, string launchingDocId, out List<TerminalDocument> panes)
+        {
+            panes = _dockPanel.Contents.OfType<TerminalDocument>().Where(d => !d.IsDisposed).ToList();
+            var facts = panes.Select(d => new OpenPaneFacts(
+                d.DocId, d.LaunchProjectId, d.LaunchRole, d.Terminal?.IsRunning == true, d.IsStartScreenVisible, d.TabText));
+            return ProjectAlreadyOpen.FindOpenPanes(projectId, launchingDocId, facts);
+        }
+
+        /// <summary>
+        /// Shows <paramref name="pane"/> and gives it focus. The main window is restored if minimised (a
+        /// floating window is owned by it, so it is hidden while the main window is minimised); a pane in a
+        /// floating window then has that window restored and brought to the front.
+        /// </summary>
+        private void BringPaneToFront(TerminalDocument pane)
+        {
+            if (WindowState == FormWindowState.Minimized)
+                WindowState = FormWindowState.Normal;
+            Activate();
+
+            if (pane.DockState == DockState.Float && pane.Pane?.FloatWindow is Form floatWindow && !floatWindow.IsDisposed)
+            {
+                if (floatWindow.WindowState == FormWindowState.Minimized)
+                    floatWindow.WindowState = FormWindowState.Normal;
+                floatWindow.Activate();
+            }
+
+            pane.Activate();
+            pane.FocusTerminal();
+            _lastActiveTerminal = pane;
         }
 
         /// <summary>
@@ -5242,7 +5484,11 @@ namespace MultiTerminal
                 if (projectRoot == null)
                     return new LaunchSessionChoiceModel(null, panes);
 
-                var catalog = CreateSessionCatalog();
+                // GitHub #97: the sessions offered are the ones under the project's own Claude profile. A
+                // profile that cannot be honoured is a load failure the user is told about, never Default's list.
+                var catalog = CreateSessionCatalog(project, out string catalogRefusal);
+                if (catalog == null)
+                    return LaunchSessionChoiceModel.ForLoadFailure(panes, catalogRefusal); // logged once by ClaudeProfileDataRoots
                 var entries = catalog.List(projectRoot, LaunchSessionChoiceModel.LiveSessionIdsOf(panes), DateTime.UtcNow);
 
                 // Task 7d20e94c: which helpers each offered session left open, from the launch record.
@@ -5273,13 +5519,29 @@ namespace MultiTerminal
         /// The session catalog the launch prompt and the helper resume read (task ec2ed636; shared since
         /// 7d20e94c). Agent names come from session_agent_map (one snapshot query), summaries from
         /// session_lineage.
+        ///
+        /// <para>GitHub #97 (ticket c4bf09ca): the transcripts are read from the project's own Claude
+        /// profile, <c>ClaudeProfileDataRoots.ForProject(project.Id, null)</c> + "projects". That is the
+        /// decision the launch makes for the same project (<c>TryGetLaunchClaudeProfile(project.Id, null)</c>
+        /// and, for a resumed helper, <c>DecideLaunchClaudeProfile(project.Id, cwd, ...)</c>: in both the
+        /// project row decides), so the session offered is one that profile can resume. When the profile
+        /// cannot be honoured the result is null with <paramref name="refusal"/> saying why: never the
+        /// Default profile's folder. The profile decision is read here, before any name is registered.</para>
         /// </summary>
-        private SessionCatalog CreateSessionCatalog()
+        private SessionCatalog CreateSessionCatalog(Models.Project project, out string refusal)
         {
+            // A refusal is no catalog. A decided profile whose folder is not there yet (Default on a machine
+            // where Claude Code has never run) is an empty catalog: no history, a silent new session, and
+            // nothing is created. The path is the data-roots code's, not built here.
+            var root = ClaudeProfileDataRoots.SessionRootForProject(project?.Id, null, ClaudeProfileProjectLookup.Current(), ClaudeProfileResolver.CurrentContext());
+            refusal = root.Refusal;
+            if (root.Root == null)
+                return null;
+
             var taskDb = _mcpServer?.Broker?.TaskDb;
             var agentMap = taskDb?.GetAllSessionAgentNames();
             return new SessionCatalog(
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects"),
+                root.Root.ProjectsDir,
                 sid => agentMap != null && agentMap.TryGetValue(sid, out var agent) ? agent : null,
                 sid => taskDb?.GetSessionById(sid)?.Summary);
         }
@@ -5327,9 +5589,10 @@ namespace MultiTerminal
             string projectRoot = GetLaunchableProjectRoot(project);
             uint? inputTickAtStart = Services.OwnerInputClock.LastInputTick();
             SessionCatalog catalog = null;
+            string catalogRefusal = null;
             try
             {
-                catalog = projectRoot == null ? null : CreateSessionCatalog();
+                catalog = projectRoot == null ? null : CreateSessionCatalog(project, out catalogRefusal);
             }
             catch (Exception ex)
             {
@@ -5343,7 +5606,9 @@ namespace MultiTerminal
                 {
                     if (catalog == null)
                     {
-                        report.AddSkipped(helperName, "the project's session history could not be read");
+                        report.AddSkipped(helperName, catalogRefusal != null
+                            ? $"the project's session history could not be read ({catalogRefusal})"
+                            : "the project's session history could not be read");
                         continue;
                     }
 
@@ -5362,7 +5627,9 @@ namespace MultiTerminal
                         continue;
                     }
 
-                    var launchCmd = Services.LaunchCommandBuilder.BuildCommand(TerminalKind.ClaudeCode, project, check.Cwd, entry.SessionId);
+                    // A helper resumed with its PM is a helper: the helper branch of the decision, not the PM's.
+                    var resumeModel = DecideLaunchClaudeModel(ClaudeModelRole.Helper, project.Id, null, null, $"resumed helper '{helperName}'");
+                    var launchCmd = Services.LaunchCommandBuilder.BuildCommand(TerminalKind.ClaudeCode, project, check.Cwd, entry.SessionId, resumeModel.Model);
                     if (!string.IsNullOrEmpty(launchCmd.BootstrapError))
                     {
                         report.AddSkipped(helperName, $"its launch command could not be built ({launchCmd.BootstrapError.TrimEnd('.')})");
@@ -5390,7 +5657,8 @@ namespace MultiTerminal
                         resumeSessionId: entry.SessionId,
                         pinWorkingDirectory: true,
                         launchKind: Services.PaneLaunchKind.Claude,
-                        yieldFocusToTyping: true);
+                        yieldFocusToTyping: true,
+                        subagentModel: resumeModel.SubagentModel);
 
                     if (profileRefusal != null)
                     {
@@ -5657,7 +5925,12 @@ namespace MultiTerminal
                 }
 
                 var live = CollectLiveSessionStates(null);
-                var catalog = CreateSessionCatalog();
+                var catalog = CreateSessionCatalog(project, out string catalogRefusal);
+                if (catalog == null)
+                {
+                    skipped.Add($"{display}: its project's session history could not be read ({catalogRefusal})"); // logged once by ClaudeProfileDataRoots
+                    return false;
+                }
                 var entry = catalog.TryGetEntry(projectRoot, pm.Pane.SessionId, LaunchSessionChoiceModel.LiveSessionIdsOf(live), DateTime.UtcNow);
                 var check = HelperResume.Check(
                     ToOpenHelper(pm.Pane), entry, live, projectRoot,
@@ -6021,8 +6294,11 @@ namespace MultiTerminal
 
                 // Always a quiet start (Owner request 2026-10-04): a plain Claude session opens at an idle
                 // prompt, with no session-start menu, for the default and for a named agent alike.
-                doc.StartTerminal(workingDir, terminalName, launch.AutoRunCommand, isTeamLead: isTeamLead, taskWorktreePath: taskWorktreePath, claudeProfile: claudeProfile,
-                    launchKind: Services.PaneLaunchKind.Claude, launchQuietStart: true);
+                // The command was built before the folder was known, so the model (a project's own, when the folder
+                // belongs to one) is added now, in the place the builder would have put it.
+                var justClaudeModel = DecideLaunchClaudeModel(ClaudeModelRole.ProjectPane, null, workingDir, null, $"Claude in '{workingDir}'");
+                doc.StartTerminal(workingDir, terminalName, Services.LaunchCommandBuilder.WithModel(launch.AutoRunCommand, justClaudeModel.Model), isTeamLead: isTeamLead, taskWorktreePath: taskWorktreePath, claudeProfile: claudeProfile,
+                    launchKind: Services.PaneLaunchKind.Claude, launchQuietStart: true, subagentModel: justClaudeModel.SubagentModel);
 
                 doc.Activate();
                 doc.FocusTerminal();
@@ -6119,7 +6395,8 @@ namespace MultiTerminal
 
                 // Build launch command for the project's default terminal (Claude Code or Codex)
                 var terminalKind = Models.TerminalKindHelper.ParseOrDefault(project.DefaultTerminal);
-                var launchCmd = Services.LaunchCommandBuilder.BuildCommand(terminalKind, project);
+                var newProjectModel = DecideLaunchClaudeModel(ClaudeModelRole.ProjectPane, project.Id, null, null, $"new project '{project.Name}'");
+                var launchCmd = Services.LaunchCommandBuilder.BuildCommand(terminalKind, project, model: newProjectModel.Model);
 
                 // Bootstrap gate — tail message tweaked because the project was created
                 // but no terminal started, so the user can retry from the project card.
@@ -6187,9 +6464,8 @@ namespace MultiTerminal
                     {
                         sourceDoc.ClaudeCodeDetected -= newProjectHandler;
 
-                        // Give Claude Code time to settle: past the "initializing..." kick and the
-                        // session-start turn it starts, or, on a quiet-start project (GitHub #34), where
-                        // nothing is typed, simply until the prompt is ready.
+                        // Give Claude Code time to settle until the prompt is ready. This launch is a quiet
+                        // start (GitHub #91, see StartTerminal below), so nothing else is typed into it.
                         await Task.Delay(3000);
                         _debugLogService?.Trace("MainForm", "New project flow: injecting /new-project");
 
@@ -6229,9 +6505,15 @@ namespace MultiTerminal
 
                 // Start terminal in project folder
                 _debugLogService?.Trace("StartScreen", $"Launching new project '{project.Name}' in {launchDir} (taskWorktreePath='{taskWorktreePath2 ?? "null"}')");
+                // GitHub #91: a Claude pane opened by New Project is a quiet start for this launch, so MT does
+                // not type "initializing..." and the session-start menu never opens. /new-project (above)
+                // is then the only thing typed; before, it queued behind the menu and ran after whatever
+                // the user picked there. The project's own Quiet start setting is untouched.
                 sourceDoc.StartTerminal(launchDir, terminalName, autoRunCommand,
                     projectId: project.Id, isTeamLead: isTeamLead, gatewayProfile: gatewayProfile2, taskWorktreePath: taskWorktreePath2,
-                    claudeProfile: claudeProfile2, launchKind: Services.PaneLaunchKind.From(terminalKind));
+                    claudeProfile: claudeProfile2, launchKind: Services.PaneLaunchKind.From(terminalKind),
+                    launchQuietStart: NewProjectLaunch.IsQuietStart(terminalKind),
+                    subagentModel: terminalKind == TerminalKind.ClaudeCode ? newProjectModel.SubagentModel : null);
 
                 sourceDoc.Activate();
                 sourceDoc.FocusTerminal();
@@ -6624,6 +6906,40 @@ namespace MultiTerminal
             else
                 _debugLogService?.Warning("ClaudeProfile", $"LAUNCH REFUSED. {decision.Refusal}");
 
+            return decision;
+        }
+
+        /// <summary>
+        /// THE decision of which model a Claude launch uses (ticket b0d2f090). Every launch site asks here and
+        /// none reads the settings itself; the rules are <see cref="ClaudeModelLaunchPolicy"/>'s. The project
+        /// row is read fresh from the database, so a change in the project settings form applies at the next
+        /// launch. A project is looked up by <paramref name="projectId"/>, else discovered from
+        /// <paramref name="folder"/>; no project means the global settings alone. Never throws: a lookup that
+        /// fails is logged and decided without a project.
+        /// </summary>
+        /// <param name="role">Project pane or helper. A helper resumed with its PM is a helper.</param>
+        /// <param name="requestedModel">spawn_helper's model, or null.</param>
+        private ClaudeModelDecision DecideLaunchClaudeModel(ClaudeModelRole role, string projectId, string folder, string requestedModel, string launchLabel)
+        {
+            string projectModel = null, projectHelperModel = null;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(projectId) && !string.IsNullOrWhiteSpace(folder))
+                    projectId = _projectService?.DiscoverProject(folder)?.Id;
+
+                var row = string.IsNullOrWhiteSpace(projectId) ? null : _sharedProjectDatabase?.GetRichProject(projectId);
+                projectModel = row?.ClaudeModel;
+                projectHelperModel = row?.ClaudeHelperModel;
+            }
+            catch (Exception ex)
+            {
+                _debugLogService?.Warning("ClaudeModel", $"{launchLabel}: project model lookup failed, using the global settings: {ex.Message}");
+            }
+
+            var decision = ClaudeModelLaunchPolicy.Decide(role, requestedModel, projectModel, projectHelperModel, _settings?.GetClaudeModelSettings());
+            if (decision.Problem != null)
+                _debugLogService?.Warning("ClaudeModel", $"{launchLabel}: {decision.Problem}");
+            _debugLogService?.Info("ClaudeModel", $"{launchLabel}: {role} model '{decision.Model ?? "(Claude Code default)"}' (from {decision.Source}), subagent model '{decision.SubagentModel ?? "(none)"}'.");
             return decision;
         }
 
@@ -8082,7 +8398,9 @@ namespace MultiTerminal
             // No --resume: this starts a fresh session under the new name. Resuming a past session is the
             // project launch prompt's job (task ec2ed636, TryChooseLaunchSession), which knows the session's
             // own cwd; this path keeps the pane's cwd and could not find a session recorded elsewhere.
-            string autoRunCommand = LaunchCommandBuilder.BuildClaudeCommand(null, workingDirectory).AutoRunCommand;
+            // A project pane when the folder belongs to a project, else the global project model.
+            var launchAsModel = DecideLaunchClaudeModel(ClaudeModelRole.ProjectPane, null, workingDirectory, null, launchAsLabel);
+            string autoRunCommand = LaunchCommandBuilder.BuildClaudeCommand(null, workingDirectory, model: launchAsModel.Model).AutoRunCommand;
 
             // Quiet start (GitHub #34, pipeline run 1): "Launch as..." is not a project launch, so it passes
             // no projectId (that would also set MULTITERMINAL_PROJECT_PM and the "(PM)" badge, which this
@@ -8094,7 +8412,8 @@ namespace MultiTerminal
             doc.Terminal.Stop();
             doc.CustomTitle = terminalName;
             doc.StartTerminal(workingDirectory, terminalName, autoRunCommand, taskWorktreePath: taskWorktreePath,
-                quietStartProjectId: quietStartProjectId, claudeProfile: claudeProfile, launchKind: Services.PaneLaunchKind.Claude);
+                quietStartProjectId: quietStartProjectId, claudeProfile: claudeProfile, launchKind: Services.PaneLaunchKind.Claude,
+                subagentModel: launchAsModel.SubagentModel);
 
             // Auto-initialization is handled by OnClaudeCodeDetected when Claude Code's output is detected.
             // This ensures injection happens AFTER Claude Code is ready, not just after WebView2 loads.
@@ -9499,12 +9818,17 @@ namespace MultiTerminal
                 catch (ObjectDisposedException) { }
             };
 
-            // Auto-remove slot when agent completes.
-            // Panel is removed for all agents (team and non-team) once the process exits.
+            // Remove the slot when the agent stops, unless it FINISHED (exit 0) and Settings > General >
+            // Agent Panel > On Complete is "Keep open" (GH #89): then the panel stays, showing
+            // "completed", until the Owner closes it with its X. Any other stop (a team reclaiming
+            // the transcript, the watcher shutting down, an error) still removes it.
             source.Stopped += (s, exitCode) =>
             {
                 void HandleEmbeddedStopped()
                 {
+                    if (exitCode == 0 && _settings?.GetAgentPanelCloseMode() == "ManualClose")
+                        return;
+
                     if (_embeddedAgentMap.Remove(panelKey, out var info))
                     {
                         info.Control?.DetachAgent();
@@ -9652,6 +9976,17 @@ namespace MultiTerminal
 
                     void DoCreate()
                     {
+                        // The key is built from the display name, which repeats ("verifier"). A finished
+                        // panel kept open by On Complete = Keep open (GH #89) gives way to the new agent;
+                        // otherwise the new agent would run with no panel at all.
+                        if (_embeddedAgentMap.TryGetValue(panelKey, out var held) && held.Control?.HasActiveAgent != true
+                            && _embeddedAgentMap.Remove(panelKey, out var finished))
+                        {
+                            finished.Control?.DetachAgent();
+                            finished.Terminal?.EmbeddedAgentPanel?.RemoveAgentSlot(finished.Slot);
+                            finished.Control?.Dispose();
+                        }
+
                         if (!_embeddedAgentMap.ContainsKey(panelKey))
                             CreateAgentPanel(e.Tailer, e.MemberName, panelKey, resolvedSpawner, e.TaskDescription, e.SubagentType);
                     }

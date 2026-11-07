@@ -8,14 +8,14 @@ It was written by following these steps on a clean Windows 11 machine that had n
 
 | Requirement | Notes |
 |---|---|
-| **Windows 10/11, x64** | MT is a WinForms/WebView2 app (`net8.0-windows`, `win-x64`). It does not build on Linux or macOS. |
-| **.NET SDK 8 or later** | SDK 10 works (that is what CI uses). There is deliberately no `global.json`. You do **not** need a .NET 8 *runtime* to run the app: it builds self-contained. |
+| **Windows 10/11, x64** | MT is a WinForms/WebView2 app (`net10.0-windows`, `win-x64`). It does not build on Linux or macOS. |
+| **.NET SDK 10 or later** | CI uses SDK 10. There is deliberately no `global.json`. You do **not** need a .NET *runtime* installed to run the app: it builds self-contained. |
 | **Node.js** | Needed by the build (it installs MT's MCP server with `npm ci`) and by the Claude Code plugin's hooks. **See the Node version note below.** |
 | **Git** | Plus a GitHub SSH key if you want the plugin install in step 5 to work as written. |
 | **Claude Code CLI** | Installed, on `PATH`, and signed in at least once (`claude` in a normal terminal). |
 | **WebView2 Runtime** | Preinstalled on Windows 11. On Windows 10 you may need to install it. |
 
-> ⚠️ **Node version.** The plugin's hooks store activity, profiles and session state in MT's SQLite database through a bundled native `better-sqlite3` binary built for **Node 24**. On any other Node major version that binary does not load, and those features switch off **silently** (for example, the Attention rail never clears a card after you answer a question). Until [multiterminal-marketplace#2](https://github.com/ClarionLive/multiterminal-marketplace/pull/2) is merged, use **Node 24**. Once it is, any Node from 22.13 up works (22.5 to 22.12 have the built-in SQLite only behind a flag the hooks do not use). Tracking issue: [multiterminal-marketplace#1](https://github.com/ClarionLive/multiterminal-marketplace/issues/1).
+> ⚠️ **Node version: 22.13 or newer (24 LTS recommended).** The plugin's hooks store activity, profiles and session state in MT's SQLite database through a bundled native `better-sqlite3` binary built for Node 24, and fall back to Node's built-in `node:sqlite` when that binary does not load ([multiterminal-marketplace#2](https://github.com/ClarionLive/multiterminal-marketplace/pull/2)). `node:sqlite` exists without a flag from Node 22.13 (22.5 to 22.12 have it only behind a flag the hooks do not use). Below 22.13 those features switch off **silently** (for example, the Attention rail never clears a card after you answer a question). Tracking issue: [multiterminal-marketplace#1](https://github.com/ClarionLive/multiterminal-marketplace/issues/1).
 
 ## 2. Clone
 
@@ -33,7 +33,7 @@ dotnet build MultiTerminal.csproj -c Debug -p:SharedStagedPath=C:\path\to\some\s
 The app is built to:
 
 ```
-bin\Debug\net8.0-windows\win-x64\MultiTerminal.exe
+bin\Debug\net10.0-windows\win-x64\MultiTerminal.exe
 ```
 
 **Why `-p:SharedStagedPath=…`:** after every build, the project mirrors its output to a "staged" folder for the maintainers' own deploy flow. The default is a path on the maintainer's machine (`H:\DevLaptop\ClarionPowerShell\staged`). Point it anywhere you like instead, either with that property or once with an environment variable:
@@ -52,7 +52,7 @@ You can ignore the staged folder afterwards; you run MT from `bin\Debug` (step 4
 ## 4. Run
 
 ```powershell
-.\bin\Debug\net8.0-windows\win-x64\MultiTerminal.exe
+.\bin\Debug\net10.0-windows\win-x64\MultiTerminal.exe
 ```
 
 On first launch:
@@ -98,7 +98,7 @@ npm ci; npm run lint
 node --test mcp/test/*.test.mjs                          # Node 21+ for the glob
 ```
 
-The test project is not self-contained, so it needs a **.NET 8 runtime**. If you only have a newer one installed (for example only .NET 10), let it roll forward:
+The test project is not self-contained, so it runs on the installed **.NET 10 runtime**, which the .NET 10 SDK includes. Only if you have just a newer runtime (for example .NET 11) do you need to let it roll forward:
 
 ```powershell
 $env:DOTNET_ROLL_FORWARD = 'Major'

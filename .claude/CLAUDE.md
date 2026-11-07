@@ -5,6 +5,15 @@ A multi-agent coordination system for Claude Code. WinForms desktop app (C#/.NET
 > Agent behavioral instructions (kanban workflow, messaging, task terminology, MT events) are the MultiTerminal plugin's `agent-rules.md`, which the plugin's `agent-rules-hook.js` prints into every session (Claude Code does not load a plugin's CLAUDE.md). MT-repo-only working rules (build/deploy, this machine, license) are in `.claude/rules/mt-dev-rules.md`. This file is only the codebase reference for working on MT source code.
 > Detailed reference tables (database schema, folder map, task guides, events) are in `.claude/rules/` and load on demand.
 
+| Before changing | Read |
+|---|---|
+| Session launch/resume/restore, including launch work in `MainForm.cs` | `launch-session-choice.md` |
+| Tests and verification strategy | `verification-discipline.md` |
+| Claude profiles, including profile work in `MainForm.cs` | `claude-profiles.md` |
+| Checklist dependency graphs | `checklist-graph.md` |
+| `MessageBroker` region extraction | `broker-extraction-pattern.md` |
+| ClarionAssistant embedded-session integration | `ca-embedded-sessions.md` |
+
 ## ⛔ YOU ARE RUNNING INSIDE MULTITERMINAL — READ FIRST
 
 **You (this Claude Code terminal) are ALWAYS one of MultiTerminal's hosted terminals. MT is the desktop app you live inside.** This changes how build/run/deploy work here:
@@ -74,7 +83,7 @@ Present-but-unparseable or clamped values are logged (`DebugLogService` "CodeGra
 2. Add persistence to `TaskDatabase.cs` (table + CRUD + migration)
 3. Add routing to `MessageBroker.cs` (methods + events)
 4. Add MCP tool to Node.js server if agents need access
-5. Add REST endpoint to `API/Controllers/` if HTTP needed
+5. Add REST endpoint to `API/Controllers/` if HTTP needed; add every new or changed route to `docs/html/api-reference.html` too, or `ApiReferenceRouteDriftTests` fails
 
 **Adding an MCP Tool:**
 1. Add tool definition in `%APPDATA%/multiterminal/mcp/index.js`
@@ -113,7 +122,7 @@ If a new rule starts firing across many files, the right move is usually: (1) de
 
 ### Continuous Integration (GitHub Actions)
 
-Every push to `main` / `master` / `integration/**` and every PR runs `.github/workflows/ci.yml` on a **windows-latest** runner (the app is WinForms/WebView2 on `net8.0-windows` and cannot build on Linux). One job runs, in order: verify the bundled `tools/rg.exe` matches the SHA256 in `tools/rg.provenance.txt` → `dotnet restore` + `dotnet build MultiTerminal.csproj -c Debug` (with `TreatWarningsAsErrors` this build **is** the C# lint gate) → `dotnet build -c Release` (runs the fatal Release-only `StageMcpForInstaller`, so a broken deploy/installer-staging path fails CI) → `dotnet build AgentProcessTest` (a console harness, not a test target, but it ProjectReferences the app so this catches API-break rot) → `dotnet test MultiTerminal.Tests/MultiTerminal.Tests.csproj` (the only xUnit project) → `npm ci` + `npm run lint` (ESLint over `hooks/` + `scripts/`) → `node --test mcp/test/*.test.mjs` (the MCP server's `projectId` traversal fixtures + the tool-def↔handler consistency gate). NuGet (`~/.nuget/packages`) and npm are cached; third-party actions are pinned to commit SHAs; the token is read-only.
+Every push to `main` / `master` / `integration/**` and every PR runs `.github/workflows/ci.yml` on a **windows-latest** runner (the app is WinForms/WebView2 on `net10.0-windows` and cannot build on Linux). One job runs, in order: verify the bundled `tools/rg.exe` matches the SHA256 in `tools/rg.provenance.txt` → `dotnet restore` + `dotnet build MultiTerminal.csproj -c Debug` (with `TreatWarningsAsErrors` this build **is** the C# lint gate) → `dotnet build -c Release` (runs the fatal Release-only `StageMcpForInstaller`, so a broken deploy/installer-staging path fails CI) → `dotnet build AgentProcessTest` (a console harness, not a test target, but it ProjectReferences the app so this catches API-break rot) → `dotnet test MultiTerminal.Tests/MultiTerminal.Tests.csproj` (the only xUnit project) → `npm ci` + `npm run lint` (ESLint over `hooks/` + `scripts/`) → `node --test mcp/test/*.test.mjs` (the MCP server's `projectId` traversal fixtures + the tool-def↔handler consistency gate). NuGet (`~/.nuget/packages`) and npm are cached; third-party actions are pinned to commit SHAs; the token is read-only.
 
 **Reproduce locally** (from the repo root) — these are the exact CI commands:
 
@@ -126,7 +135,7 @@ npm ci && npm run lint
 node --test mcp/test/*.test.mjs          # needs Node >= 21 for the glob
 ```
 
-**SDK note:** the runner uses whatever SDK `windows-latest` ships (currently 10.x); there is deliberately **no `global.json`** pinning .NET 8, because dev machines here run SDK 9 and a hard 8.0.x pin would break their local build. The build is SDK-tolerant by design — the framework is fixed by the `net8.0-windows` TFM and analyzers are pinned via NuGet packages — and CI logs the resolved SDK ("Log toolchain versions" step) so drift stays visible.
+**SDK note:** the app targets **.NET 10 LTS** (`net10.0-windows`, moved from .NET 8 in task 12866c92 / GH #47 before .NET 8's end of support on 10 Nov 2026), so building needs **SDK 10 or later**; `setup-dotnet` installs `10.0.x`. There is deliberately **no `global.json`**: a pin to one SDK band would break a dev machine that only has a newer one. The build is SDK-tolerant by design — the framework is fixed by the TFM and analyzers are pinned via NuGet packages (`Microsoft.CodeAnalysis.NetAnalyzers` 10.0.403) — and CI logs the resolved SDK ("Log toolchain versions" step) so drift stays visible. The **MCP Gateway** (`McpGateway.exe`) is a separate source tree that still targets `net8.0` and is published framework-dependent, so it needs its own retarget.
 
 **CI-specific build behavior:** the dev-only `AfterTargets="Build"` targets are neutralized on the runner so they neither fail nor spam the log. `CopyToStaged`'s mirror (default `H:\...\staged`) is redirected to a runner-workspace dir via the `MULTITERMINAL_STAGED_PATH` env override, and `SyncMcpServer` self-skips when `CI=true` (see `scripts/sync-mcp-server.ps1`) because there is no live `%APPDATA%` install to refresh — the **fatal** Release installer-staging path (`StageMcpForInstaller`, `-FailOnError`) is never skipped, which is exactly why the Release build step above is meaningful CI coverage. If you add a new node test file under `mcp/test/`, the glob picks it up automatically; if you add a new .NET test **project**, add its `dotnet test` invocation to the workflow. If you intentionally update `tools/rg.exe`, update `tools/rg.provenance.txt` (version + SHA256) in the same commit or the integrity step fails.
 

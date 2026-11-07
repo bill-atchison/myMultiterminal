@@ -3,13 +3,13 @@
 ; https://jrsoftware.org/isinfo.php
 
 #define AppName "MultiTerminal"
-#define AppVersion "3.0.0"
+#define AppVersion "3.0.1"
 #define AppPublisher "MultiTerminal"
 #define AppExeName "MultiTerminal.exe"
 #define AppURL "https://github.com/peterparker57"
 
 ; Source directories - adjust these for your build machine
-#define PublishDir "..\bin\Release\net8.0-windows\win-x64\publish"
+#define PublishDir "..\bin\Release\net10.0-windows\win-x64\publish"
 ; MCP server ships from the git-canonical repo copy staged by the build's
 ; StageMcpForInstaller target (mcp-dist = repo mcp/ + freshly `npm install`ed
 ; deps), NOT the build machine's %APPDATA% profile. This removes the silent
@@ -21,8 +21,14 @@
 ; publish-installer (not bin\publish) — live gateways run from bin\publish and lock
 ; its DLLs, so the release publish targets this dedicated staging dir (task df1f521f).
 #define McpGatewayPublishDir "..\..\McpGateway\bin\publish-installer\win-x64"
-; Claude Code plugin marketplace (hooks, agents, skills, CLAUDE.md, channel MCP)
-#define PluginMarketplaceDir GetEnv("USERPROFILE") + "\.claude\plugins\marketplaces\multiterminal-marketplace"
+; Claude Code plugin marketplace (hooks, agents, skills, CLAUDE.md, channel MCP).
+; build-installer.ps1 passes /DPluginMarketplaceDir=<installer\Output\plugin-staging>: a
+; clean checkout of the marketplace's GitHub ref, .git removed, stamped with
+; .mt-plugin-source.json (task 4dc459e4). The default below is only for a bare ISCC run,
+; and ships whatever branch the build machine's live plugin folder is on.
+#ifndef PluginMarketplaceDir
+  #define PluginMarketplaceDir GetEnv("USERPROFILE") + "\.claude\plugins\marketplaces\multiterminal-marketplace"
+#endif
 #define ToolsDir "..\tools"
 #define DocsDir "..\docs\html"
 
@@ -50,6 +56,16 @@ SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
+; Refuse to install (or uninstall) while MultiTerminal runs: MT holds this mutex for its whole process
+; life (SingleInstanceGuard.MutexName; case-sensitive, keep the two in step). Besides never copying over
+; a running MT's files, this keeps setup's plugin copy into the live marketplace root ([Files], plugin
+; entry) from racing MT's Update plugin action, which swaps that root under its own per-root lock that
+; setup does not take (task 4dc459e4). Setup checks at startup and shows "close all instances, then OK or
+; Cancel" until MT exits; /SILENT still shows that box, /SUPPRESSMSGBOXES answers Cancel and setup exits
+; without installing. Gap: the mutex is Local\, so an MT running in ANOTHER Windows session (another
+; user, RDP) is not seen, and that MT's plugin update lock is not taken either. No Global\ form is
+; listed because MT never creates one.
+AppMutex=Local\MultiTerminal.SingleInstance
 UsedUserAreasWarning=no
 WizardStyle=modern
 SetupIconFile=..\Assets\MultiTerminal.ico
@@ -158,9 +174,25 @@ Source: "{#PublishDir}\DashboardHeader\*"; DestDir: "{app}\DashboardHeader"; Com
 Source: "{#PublishDir}\shared\*"; DestDir: "{app}\shared"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PublishDir}\tools\*"; DestDir: "{app}\tools"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PublishDir}\LocalEmbeddingsModel\*"; DestDir: "{app}\LocalEmbeddingsModel"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
+; Missing from 3.0.0 (task 9ad3a95c). build-installer.ps1's publish coverage check now fails
+; the build when a publish folder or root file is neither listed here nor excluded with a reason.
+; Attention panel page (AttentionPanelControl loads AttentionPanel\attention-panel.html).
+Source: "{#PublishDir}\AttentionPanel\*"; DestDir: "{app}\AttentionPanel"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
+; Code review popup page (CodeReviewPopupForm loads Dialogs\code-review.html).
+Source: "{#PublishDir}\Dialogs\*"; DestDir: "{app}\Dialogs"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
+; statusline.js (LaunchCommandBuilder forces it as every pane's statusLine; without it the header
+; context and quota stay "--%") and the agent git/gh identity scripts (AgentGitIdentityWiring).
+Source: "{#PublishDir}\scripts\*"; DestDir: "{app}\scripts"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
+; Multi-Connect phone gateway web app (MultiRemoteGatewayHost serves wwwroot; it refuses to start without it).
+Source: "{#PublishDir}\wwwroot\*"; DestDir: "{app}\wwwroot"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs
+; ASP.NET configuration: AllowedHosts (host filtering) and the MultiRemote defaults. Per-install
+; values belong in settings.txt or appsettings.Local.json, so overwriting this file is safe.
+Source: "{#PublishDir}\appsettings.json"; DestDir: "{app}"; Components: main; Flags: ignoreversion
+; The template the gateway's login error tells the user to copy to appsettings.Local.json.
+Source: "{#PublishDir}\appsettings.Local.json.example"; DestDir: "{app}"; Components: main; Flags: ignoreversion
 
 ; ============================================================
-; --- .NET Runtime: Managed DLLs (skip if .NET 8 installed) ---
+; --- .NET Runtime: Managed DLLs (skip if .NET 10 installed) ---
 ; ============================================================
 Source: "{#PublishDir}\Microsoft.AspNetCore.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\Microsoft.AspNetCore.*.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
@@ -180,7 +212,7 @@ Source: "{#PublishDir}\netstandard.dll"; DestDir: "{app}"; Components: main; Fla
 Source: "{#PublishDir}\WindowsBase.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 
 ; ============================================================
-; --- .NET Runtime: WPF/WinForms managed DLLs (skip if .NET 8) ---
+; --- .NET Runtime: WPF/WinForms managed DLLs (skip if .NET 10) ---
 ; ============================================================
 Source: "{#PublishDir}\Accessibility.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\DirectWriteForwarder.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
@@ -192,11 +224,13 @@ Source: "{#PublishDir}\WindowsFormsIntegration.dll"; DestDir: "{app}"; Component
 Source: "{#PublishDir}\UIAutomation*.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 
 ; ============================================================
-; --- .NET Runtime: Native binaries (skip if .NET 8) ---
+; --- .NET Runtime: Native binaries (skip if .NET 10) ---
 ; ============================================================
 Source: "{#PublishDir}\coreclr.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\clrjit.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\clrgc.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
+; New in the .NET 10 runtime (task 12866c92); loaded only when DOTNET_GCName selects it.
+Source: "{#PublishDir}\clrgcexp.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\clretwrc.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\hostfxr.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\hostpolicy.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
@@ -214,7 +248,7 @@ Source: "{#PublishDir}\aspnetcorev2_inprocess.dll"; DestDir: "{app}"; Components
 Source: "{#PublishDir}\vcruntime140_cor3.dll"; DestDir: "{app}"; Components: main; Flags: ignoreversion skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 
 ; ============================================================
-; --- .NET Runtime: Locale resource directories (skip if .NET 8) ---
+; --- .NET Runtime: Locale resource directories (skip if .NET 10) ---
 ; ============================================================
 Source: "{#PublishDir}\cs\*"; DestDir: "{app}\cs"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 Source: "{#PublishDir}\de\*"; DestDir: "{app}\de"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
@@ -231,7 +265,7 @@ Source: "{#PublishDir}\zh-Hans\*"; DestDir: "{app}\zh-Hans"; Components: main; F
 Source: "{#PublishDir}\zh-Hant\*"; DestDir: "{app}\zh-Hant"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 
 ; ============================================================
-; --- .NET Runtime: Native shims directory (skip if .NET 8) ---
+; --- .NET Runtime: Native shims directory (skip if .NET 10) ---
 ; ============================================================
 Source: "{#PublishDir}\runtimes\*"; DestDir: "{app}\runtimes"; Components: main; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist; Check: ShouldInstallRuntimeFiles
 
@@ -258,7 +292,14 @@ Source: "{#DocsDir}\*"; DestDir: "{app}\docs\html"; Components: docs; Flags: ign
 ; --- Claude Code config profile can use. GetPluginDir returns exactly the
 ; --- old path for the default choice.
 ; ============================================================
-Source: "{#PluginMarketplaceDir}\*"; DestDir: "{code:GetPluginDir}"; Components: claude\plugin; Flags: ignoreversion recursesubdirs createallsubdirs
+; Excludes .git: the staged copy has none; this keeps a bare ISCC run from shipping the
+; build machine's repository too (task 4dc459e4).
+; Known gaps on an upgrade (Owner decision, task 4dc459e4): Inno never deletes, so a .git
+; left by 3.0.0 and any file a newer plugin commit dropped both survive in the installed
+; folder. Setup does not remove them: without git it cannot tell a developer's clone from a
+; leftover, and losing unpushed work is worse. MT's "Update plugin" action, which swaps the
+; whole folder, is the clean path.
+Source: "{#PluginMarketplaceDir}\*"; DestDir: "{code:GetPluginDir}"; Excludes: ".git"; Components: claude\plugin; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ============================================================
 ; --- MCP Server (to %APPDATA%\multiterminal\mcp) ---
@@ -358,7 +399,7 @@ Type: filesandordirs; Name: "{app}\mcps"
 [Code]
 var
   DeleteUserData: Boolean;
-  DotNet8Detected: Boolean;
+  DotNet10Detected: Boolean;
   McpPage: TInputOptionWizardPage;
   // Plugin location (ticket c8ee0eec, GH#23)
   PluginLocPage: TInputOptionWizardPage;
@@ -394,8 +435,8 @@ type
 function MtCoCreateGuid(var Guid: TMtGuid): Integer;
   external 'CoCreateGuid@ole32.dll stdcall';
 
-// Check if .NET 8 Desktop Runtime is installed (includes WinForms + WPF + NETCore)
-function IsDotNet8DesktopInstalled: Boolean;
+// Check if .NET 10 Desktop Runtime is installed (includes WinForms + WPF + NETCore)
+function IsDotNet10DesktopInstalled: Boolean;
 var
   Names: TArrayOfString;
   I: Integer;
@@ -407,7 +448,7 @@ begin
   begin
     for I := 0 to GetArrayLength(Names) - 1 do
     begin
-      if Pos('8.', Names[I]) = 1 then
+      if Pos('10.', Names[I]) = 1 then
       begin
         Result := True;
         Exit;
@@ -416,8 +457,8 @@ begin
   end;
 end;
 
-// Check if ASP.NET Core 8 Runtime is installed
-function IsDotNet8AspNetInstalled: Boolean;
+// Check if ASP.NET Core 10 Runtime is installed
+function IsDotNet10AspNetInstalled: Boolean;
 var
   Names: TArrayOfString;
   I: Integer;
@@ -429,7 +470,7 @@ begin
   begin
     for I := 0 to GetArrayLength(Names) - 1 do
     begin
-      if Pos('8.', Names[I]) = 1 then
+      if Pos('10.', Names[I]) = 1 then
       begin
         Result := True;
         Exit;
@@ -438,16 +479,16 @@ begin
   end;
 end;
 
-// Returns True when runtime DLLs should be installed (i.e., .NET 8 is NOT fully present)
+// Returns True when runtime DLLs should be installed (i.e., .NET 10 is NOT fully present)
 function ShouldInstallRuntimeFiles: Boolean;
 begin
-  Result := not (IsDotNet8DesktopInstalled and IsDotNet8AspNetInstalled);
+  Result := not (IsDotNet10DesktopInstalled and IsDotNet10AspNetInstalled);
 end;
 
 // Returns flag string for post-install.js to know which mode we're in
 function GetDotNetFlag(Param: String): String;
 begin
-  if IsDotNet8DesktopInstalled and IsDotNet8AspNetInstalled then
+  if IsDotNet10DesktopInstalled and IsDotNet10AspNetInstalled then
     Result := '--framework-dependent'
   else
     Result := '--self-contained';
@@ -891,33 +932,61 @@ begin
             and (ResultCode = 0);
 end;
 
-// Major version of the node on PATH ('v24.1.0' -> 24), or 0 when it cannot be read.
-// Exec cannot capture output, so 'node --version' is redirected to a temp file.
-function GetNodeMajorVersion: Integer;
+// Parses one run of decimal digits of Text starting at Idx; advances Idx past them.
+// Returns -1 when there is no digit at Idx.
+function ReadVersionPart(const Text: String; var Idx: Integer): Integer;
 var
-  ResultCode, I: Integer;
-  OutFile: String;
-  Output: AnsiString;
   Digits: String;
 begin
-  Result := 0;
+  Digits := '';
+  while (Idx <= Length(Text)) and (Text[Idx] >= '0') and (Text[Idx] <= '9') do
+  begin
+    Digits := Digits + Text[Idx];
+    Idx := Idx + 1;
+  end;
+  Result := StrToIntDef(Digits, -1);
+end;
+
+// Version of the node on PATH ('v24.1.0' -> 24, 1, 0, 'v24.1.0'). False when it cannot be read
+// (missing, unexpected output, or no minor part); the caller then says nothing.
+// Exec cannot capture output, so 'node --version' is redirected to a temp file.
+function GetNodeVersion(var Major, Minor, Patch: Integer; var Text: String): Boolean;
+var
+  ResultCode, Idx: Integer;
+  OutFile: String;
+  Output: AnsiString;
+begin
+  Result := False;
+  Major := 0;
+  Minor := 0;
+  Patch := 0;
+  Text := '';
   OutFile := ExpandConstant('{tmp}\node-version.txt');
   if not Exec('cmd', '/c node --version > "' + OutFile + '" 2>&1', '', SW_HIDE,
               ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
     Exit;
   if not LoadStringFromFile(OutFile, Output) then
     Exit;
-  Output := Trim(Output);
-  if (Length(Output) < 2) or (Output[1] <> 'v') then
+  Text := Output;
+  Text := Trim(Text);
+  if (Length(Text) < 2) or (Text[1] <> 'v') then
     Exit;
-  Digits := '';
-  for I := 2 to Length(Output) do
+  Idx := 2;
+  Major := ReadVersionPart(Text, Idx);
+  if (Major <= 0) or (Idx > Length(Text)) or (Text[Idx] <> '.') then
+    Exit;
+  Idx := Idx + 1;
+  Minor := ReadVersionPart(Text, Idx);
+  if Minor < 0 then
+    Exit;
+  if (Idx <= Length(Text)) and (Text[Idx] = '.') then
   begin
-    if (Output[I] < '0') or (Output[I] > '9') then
-      Break;
-    Digits := Digits + Output[I];
+    Idx := Idx + 1;
+    Patch := ReadVersionPart(Text, Idx);
+    if Patch < 0 then
+      Patch := 0;
   end;
-  Result := StrToIntDef(Digits, 0);
+  Result := True;
 end;
 
 function IsWebView2Installed: Boolean;
@@ -942,22 +1011,23 @@ end;
 function InitializeSetup: Boolean;
 var
   NodeMsg, WV2Msg, DotNetMsg: String;
-  NodeMajor: Integer;
+  NodeMajor, NodeMinor, NodePatch: Integer;
+  NodeVersionText: String;
 begin
   Result := True;
 
-  // Detect .NET 8 and cache the result
-  DotNet8Detected := IsDotNet8DesktopInstalled and IsDotNet8AspNetInstalled;
+  // Detect .NET 10 and cache the result
+  DotNet10Detected := IsDotNet10DesktopInstalled and IsDotNet10AspNetInstalled;
 
   // Show .NET detection status
-  if DotNet8Detected then
-    Log('.NET 8 Desktop + ASP.NET Core Runtime detected. Runtime DLLs will be skipped (~380 files).')
+  if DotNet10Detected then
+    Log('.NET 10 Desktop + ASP.NET Core Runtime detected. Runtime DLLs will be skipped (~380 files).')
   else
   begin
-    DotNetMsg := '.NET 8 Desktop Runtime was not detected on this system.' + #13#10 + #13#10 +
+    DotNetMsg := '.NET 10 Desktop Runtime was not detected on this system.' + #13#10 + #13#10 +
                  'The installer will include the full .NET runtime (~380 additional files).' + #13#10 +
-                 'To reduce install size, install the .NET 8 Desktop Runtime first:' + #13#10 +
-                 '  https://dotnet.microsoft.com/download/dotnet/8.0' + #13#10 + #13#10 +
+                 'To reduce install size, install the .NET 10 Desktop Runtime first:' + #13#10 +
+                 '  https://dotnet.microsoft.com/download/dotnet/10.0' + #13#10 + #13#10 +
                  'Continue with full (self-contained) installation?';
     if MsgBox(DotNetMsg, mbConfirmation, MB_YESNO) = IDNO then
     begin
@@ -1006,7 +1076,7 @@ begin
   if not IsNodeInstalled then
   begin
     NodeMsg := 'Node.js was not detected on this system.' + #13#10 + #13#10 +
-               'Node.js 24 is required for:' + #13#10 +
+               'Node.js 22.13 or newer (24 LTS recommended) is required for:' + #13#10 +
                '  - MCP Server (agent tool interface)' + #13#10 +
                '  - Claude Code hooks (activity tracking)' + #13#10 + #13#10 +
                'You can install Node.js from https://nodejs.org' + #13#10 + #13#10 +
@@ -1020,20 +1090,21 @@ begin
   end
   else
   begin
-    // GH #50: the plugin's hooks use the bundled better-sqlite3, a native binary built for Node 24,
-    // which loads on no other major version (older OR newer). The MCP server still works, but the
-    // hooks that record activity cannot open the database. 0 means the version could not be read;
+    // GH #50: the plugin's hooks open MultiTerminal's database with the bundled better-sqlite3
+    // (a native binary built for Node 24) and, when that cannot load, fall back to Node's built-in
+    // node:sqlite, which exists from Node 22.13. So any Node from 22.13 up works, newer majors
+    // included; below it the hooks cannot open the database. If the version cannot be read,
     // say nothing rather than guess.
-    NodeMajor := GetNodeMajorVersion;
-    if (NodeMajor > 0) and (NodeMajor <> 24) then
+    if GetNodeVersion(NodeMajor, NodeMinor, NodePatch, NodeVersionText) and
+       ((NodeMajor < 22) or ((NodeMajor = 22) and (NodeMinor < 13))) then
     begin
-      NodeMsg := 'Node.js ' + IntToStr(NodeMajor) + ' was detected. MultiTerminal needs Node.js 24.' + #13#10 + #13#10 +
-                 'With another Node.js version the agent tools still work, but the Claude Code hooks' + #13#10 +
+      NodeMsg := 'Node.js ' + NodeVersionText + ' was detected. MultiTerminal needs Node.js 22.13 or newer (24 LTS recommended).' + #13#10 + #13#10 +
+                 'With this Node.js version the agent tools still work, but the Claude Code hooks' + #13#10 +
                  'cannot open MultiTerminal''s database, so these stop working:' + #13#10 +
                  '  - the Activity feed' + #13#10 +
                  '  - clearing Attention cards when an agent moves on' + #13#10 +
                  '  - session state (what each terminal is doing)' + #13#10 + #13#10 +
-                 'You can install Node.js 24 from https://nodejs.org' + #13#10 + #13#10 +
+                 'You can install Node.js 24 LTS from https://nodejs.org' + #13#10 + #13#10 +
                  'Continue installation anyway?';
       if MsgBox(NodeMsg, mbConfirmation, MB_YESNO) = IDNO then
       begin

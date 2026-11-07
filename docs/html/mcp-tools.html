@@ -99,16 +99,17 @@
   <!-- list_tasks -->
   <div class="tool-block" id="list_tasks">
     <h3>list_tasks</h3>
-    <p>List all kanban tasks from the MultiTerminal board.</p>
+    <p>List kanban tasks from the MultiTerminal board. The default is one compact line per task.</p>
     <h4>Parameters</h4>
     <table>
       <thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
       <tbody>
         <tr><td><code>status</code></td><td>string</td><td>No</td><td>Filter by status: <code>all</code>, <code>todo</code>, <code>in_progress</code>, <code>done</code>, <code>suggestion</code>. Default: <code>all</code></td></tr>
+        <tr><td><code>includeDescriptions</code></td><td>boolean</td><td>No</td><td>Add a description-preview line beneath each task. Default: <code>false</code>.</td></tr>
       </tbody>
     </table>
     <h4>Returns</h4>
-    <p>Formatted text listing all tasks with ID, title, status, assignee, and priority.</p>
+    <p>Formatted text with one line per task: ID, title, status, priority, and assignee when set. Description previews are included only when requested.</p>
     <h4>Example</h4>
     <pre><code>list_tasks(status="in_progress")</code></pre>
   </div>
@@ -774,7 +775,7 @@ mark_inbox_read(userId="Owner")</code></pre>
   <!-- get_team_roster -->
   <div class="tool-block" id="get_team_roster">
     <h3>get_team_roster</h3>
-    <p>Get the team roster for a project with merged profile data (preferred_model, agent_instructions, role, skills). Use this to discover which agents to spawn for a team assembly workflow.</p>
+    <p>Get the team roster for a project with merged profile data (agent_instructions, role, skills). Use this to discover which agents to spawn for a team assembly workflow.</p>
     <h4>Parameters</h4>
     <table>
       <thead><tr><th>Name</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
@@ -902,7 +903,7 @@ mark_inbox_read(userId="Owner")</code></pre>
         <tr><td><code>projectId</code></td><td>string</td><td>Yes</td><td>Project ID</td></tr>
         <tr><td><code>agentName</code></td><td>string</td><td>Yes</td><td>Agent name (e.g., "Alice", "Bob")</td></tr>
         <tr><td><code>role</code></td><td>string</td><td>No</td><td>Agent role (e.g., "backend", "frontend", "fullstack")</td></tr>
-        <tr><td><code>preferredModel</code></td><td>string</td><td>No</td><td>Preferred Claude model: <code>opus</code>, <code>sonnet</code>, <code>haiku</code></td></tr>
+        <tr><td><code>preferredModel</code></td><td>string</td><td>No</td><td>Stored on the agent row only. No launch reads it: models come from the project's Model and Helper model settings and from MultiTerminal's Settings.</td></tr>
       </tbody>
     </table>
     <h4>Returns</h4>
@@ -1309,7 +1310,7 @@ get_latest_session(projectPath="H:\\DevLaptop\\ClarionPowerShell\\MultiTerminal"
       </tbody>
     </table>
     <h4>Returns</h4>
-    <p>Context percentage with a recommendation (wrap-up vs headroom, relative to <code>MULTITERMINAL_CONTEXT_THRESHOLD</code>, default 70), plus 5h/7d quota, token total/cost, and staleness. Returns "not reporting" if the terminal hasn't written stats yet.</p>
+    <p>Context percentage with a recommendation (wrap-up vs headroom, relative to <code>MULTITERMINAL_CONTEXT_THRESHOLD</code>, default 70), plus labelled Claude 5h/7d usage and reset countdowns when known, token total/cost, and staleness. A missing 5-hour figure is left out, because some plans have no 5-hour limit; a missing 7-day figure is shown as <code>unknown</code>, never zero. Returns "not reporting" if the terminal hasn't written context stats yet.</p>
     <h4>Example</h4>
     <pre><code>check_my_context(agentName="Alice")</code></pre>
   </div>

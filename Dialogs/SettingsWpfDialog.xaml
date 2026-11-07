@@ -512,6 +512,113 @@
                                   FontSize="13"
                                   Margin="0,12,0,0"
                                   VerticalContentAlignment="Center"/>
+                        <!-- MultiTerminal plugin version and updater (task 4dc459e4) -->
+                        <TextBlock x:Name="PluginVersionText"
+                                   Text="MultiTerminal plugin: …"
+                                   Foreground="#A0A0A0" FontFamily="Segoe UI" FontSize="11"
+                                   FontWeight="SemiBold" Margin="0,12,0,6"
+                                   TextWrapping="Wrap"/>
+                        <StackPanel Orientation="Horizontal">
+                            <Button x:Name="PluginCheckButton"
+                                    Content="Check for update"
+                                    Style="{StaticResource SmallActionButton}"
+                                    Height="28"
+                                    Click="PluginCheckButton_Click"/>
+                            <Button x:Name="PluginUpdateButton"
+                                    Content="Update now"
+                                    Style="{StaticResource SmallActionButton}"
+                                    Height="28"
+                                    Margin="6,0,0,0"
+                                    IsEnabled="False"
+                                    Click="PluginUpdateButton_Click"/>
+                        </StackPanel>
+                        <TextBlock x:Name="PluginStatusText"
+                                   Foreground="#808080" FontFamily="Segoe UI" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,4,0,0"
+                                   Text="Updates the plugin folder MultiTerminal gives to every terminal from GitHub main, replacing it whole."/>
+                    </StackPanel>
+                </GroupBox>
+
+                <!-- SECTION 0b: Claude models (ticket b0d2f090) -->
+                <GroupBox Header="Claude models"
+                          Style="{StaticResource DarkGroupBox}"
+                          Margin="0,0,0,10">
+                    <StackPanel Margin="4,8,4,4">
+                        <TextBlock Text="Project model"
+                                   Foreground="#A0A0A0" FontFamily="Segoe UI" FontSize="11"
+                                   FontWeight="SemiBold" Margin="0,0,0,6"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <ComboBox x:Name="ProjectModelCombo"
+                                      Grid.Column="0"
+                                      Style="{StaticResource DarkComboBox}"
+                                      Height="28"
+                                      SelectionChanged="ModelCombo_SelectionChanged"
+                                      ToolTip="The model a project's own terminals start on, resumed sessions included. A project can set its own in its settings."/>
+                            <TextBox x:Name="ProjectModelText"
+                                     Grid.Column="1"
+                                     Style="{StaticResource DarkTextBox}"
+                                     Foreground="#FFFFFF"
+                                     Height="28"
+                                     FontSize="12"
+                                     Margin="6,0,0,0"
+                                     Visibility="Collapsed"
+                                     ToolTip="A model name, for example claude-opus-4-8. Letters, digits, dots and hyphens."/>
+                        </Grid>
+                        <TextBlock Text="Helper model"
+                                   Foreground="#A0A0A0" FontFamily="Segoe UI" FontSize="11"
+                                   FontWeight="SemiBold" Margin="0,10,0,6"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <ComboBox x:Name="HelperModelCombo"
+                                      Grid.Column="0"
+                                      Style="{StaticResource DarkComboBox}"
+                                      Height="28"
+                                      SelectionChanged="ModelCombo_SelectionChanged"
+                                      ToolTip="The model helpers start on, including helpers resumed with their project manager. A project can set its own, and spawn_helper can name one."/>
+                            <TextBox x:Name="HelperModelText"
+                                     Grid.Column="1"
+                                     Style="{StaticResource DarkTextBox}"
+                                     Foreground="#FFFFFF"
+                                     Height="28"
+                                     FontSize="12"
+                                     Margin="6,0,0,0"
+                                     Visibility="Collapsed"
+                                     ToolTip="A model name, for example claude-opus-4-8. Letters, digits, dots and hyphens."/>
+                        </Grid>
+                        <TextBlock Text="Subagent model"
+                                   Foreground="#A0A0A0" FontFamily="Segoe UI" FontSize="11"
+                                   FontWeight="SemiBold" Margin="0,10,0,6"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <ComboBox x:Name="SubagentModelCombo"
+                                      Grid.Column="0"
+                                      Style="{StaticResource DarkComboBox}"
+                                      Height="28"
+                                      SelectionChanged="ModelCombo_SelectionChanged"
+                                      ToolTip="The model for subagents that name none (CLAUDE_CODE_SUBAGENT_MODEL). The built-in Explore and Plan agents keep their own."/>
+                            <TextBox x:Name="SubagentModelText"
+                                     Grid.Column="1"
+                                     Style="{StaticResource DarkTextBox}"
+                                     Foreground="#FFFFFF"
+                                     Height="28"
+                                     FontSize="12"
+                                     Margin="6,0,0,0"
+                                     Visibility="Collapsed"
+                                     ToolTip="A model name, for example claude-opus-4-8. Letters, digits, dots and hyphens."/>
+                        </Grid>
+                        <TextBlock Foreground="#808080" FontFamily="Segoe UI" FontSize="11"
+                                   TextWrapping="Wrap" Margin="0,8,0,0"
+                                   Text="Applies to terminals started after you save. Terminals already running keep their model."/>
                     </StackPanel>
                 </GroupBox>
 

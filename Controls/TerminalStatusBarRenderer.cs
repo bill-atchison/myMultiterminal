@@ -293,6 +293,7 @@ namespace MultiTerminal.Controls
                             SendMessage($"remoteMode:{(_lastRemoteMode.Value ? "true" : "false")}");
                         SendMessage($"projectSettings:{(_lastProjectSettingsAvailable ? "true" : "false")}");
                         SendMessage($"attention:{_lastAttention}");
+                        SendMessage($"claudeProfile:{_lastClaudeProfileJson}");
                         SendMessage($"github:{_lastGitHubJson}");
 
                         Ready?.Invoke(this, EventArgs.Empty);
@@ -339,8 +340,10 @@ namespace MultiTerminal.Controls
                     {
                         // Only the target's NAME crosses from the page; MainForm builds the URL from the
                         // project's own repo (GitHubRepoRef.WebUrl), so the page cannot open anything else.
+                        // The failure link's two targets (task 81d0e597) open MT's own forms, never a URL.
                         string target = root.TryGetProperty("target", out var tEl) && tEl.ValueKind == JsonValueKind.String ? tEl.GetString() : null;
-                        if (target == "repo" || target == "issues" || target == "pulls")
+                        if (target == "repo" || target == "issues" || target == "pulls"
+                            || target == Services.GitHubBandModel.AccountsTarget || target == Services.GitHubBandModel.ProjectTarget)
                             GitHubOpenRequested?.Invoke(this, target);
                     }
                     else if (type == "neededHeight")
@@ -530,7 +533,10 @@ namespace MultiTerminal.Controls
 
         private string _lastGitHubJson = "null";
 
-        /// <summary>A GitHub band link was clicked: "repo", "issues" or "pulls" (task e4924065).</summary>
+        /// <summary>
+        /// A GitHub band link was clicked: "repo", "issues" or "pulls" (task e4924065), or the failure
+        /// link's "accounts" or "project" (task 81d0e597).
+        /// </summary>
         public event EventHandler<string> GitHubOpenRequested;
 
         /// <summary>
@@ -541,19 +547,45 @@ namespace MultiTerminal.Controls
 
         /// <summary>
         /// Shows the project's GitHub band (task e4924065): the repo as <c>owner/name</c>, with its open
-        /// issue and PR counts when both are known. A null repo hides the band. Remembered and replayed
-        /// on 'ready'.
+        /// issue and PR counts when both are known. A null band or repo hides it. When the last check
+        /// failed (task 81d0e597) it also carries MT's failure sentence and the fixed target its link
+        /// sends, and the counts are marked stale. Remembered and replayed on 'ready'.
         /// </summary>
-        public void SetGitHub(string repoFullName, int? openIssues, int? openPullRequests)
+        public void SetGitHub(Services.GitHubBand band)
         {
-            string json = string.IsNullOrEmpty(repoFullName)
+            string json = string.IsNullOrEmpty(band?.Repo)
                 ? "null"
-                : JsonSerializer.Serialize(new { repo = repoFullName, issues = openIssues, prs = openPullRequests });
+                : JsonSerializer.Serialize(new
+                {
+                    repo = band.Repo,
+                    issues = band.OpenIssues,
+                    prs = band.OpenPullRequests,
+                    failure = band.FailureText,
+                    failureTarget = band.FailureTarget,
+                    stale = band.CountsStale,
+                });
             // MainForm refreshes every band once a minute; only a change is sent to the page.
             if (json == _lastGitHubJson) return;
             _lastGitHubJson = json;
             if (_isInitialized)
                 SendMessage($"github:{_lastGitHubJson}");
+        }
+
+        // Ticket 37edc158: the pane's Claude profile badge as wire JSON ("null" = show nothing), text and
+        // tooltip together. Last-known and replayed on 'ready', like the values around it, so a value set
+        // before the page loads is not lost and a reload keeps the tooltip too.
+        private string _lastClaudeProfileJson = "null";
+
+        /// <summary>
+        /// Shows the pane's Claude profile as a pill in the identity row; null clears it. The caller decides
+        /// what is worth showing (<see cref="Services.PaneProfileBadge"/>). Text and tooltip are free text, so
+        /// they travel as JSON and the page sets them with textContent and the title property.
+        /// </summary>
+        internal void SetClaudeProfile(Services.PaneProfileBadgeInfo badge)
+        {
+            _lastClaudeProfileJson = Services.PaneProfileBadge.ToWire(badge);
+            if (_isInitialized)
+                SendMessage($"claudeProfile:{_lastClaudeProfileJson}");
         }
 
         private string _lastAttention = "none";

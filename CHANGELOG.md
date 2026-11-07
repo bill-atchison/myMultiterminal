@@ -5,6 +5,45 @@ All notable changes to MultiTerminal are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Installed copies now include the Attention panel, the statusline script
+  (context and quota in each terminal's header), the code review page and the
+  Multi-Connect phone gateway's web app.** 3.0.0's installer left these folders
+  out, so on an installed machine the Attention panel was empty and the header's
+  Context read "--%". The installer build now fails if the build output contains
+  anything the installer does not ship or explicitly exclude.
+- **A resumed PM brings back helpers that were working in a subfolder of a
+  worktree.** Resume read only the end of long transcripts, and when the last
+  folder recorded there was a subfolder of the worktree the helper was skipped.
+  If two worktrees' names map to the same transcript folder, the session is now
+  refused with a clear reason instead of being resumed in the wrong one.
+- **The header's GitHub row shows a failed check** ("the account's token was
+  refused", "no GitHub account linked", ...) with a link to fix it, instead of
+  showing nothing until a check succeeds.
+
+### Added
+
+- **MultiTerminal can update its own plugin.** Settings > General shows which
+  plugin commit MT uses, with Check for update and Update now. MT checks once a
+  day at startup and leaves one Inbox notice when there is a newer plugin; it
+  never installs on its own. A plugin folder that is a git clone with local
+  work is never replaced, and an interrupted update is finished or undone the
+  next time MT starts.
+- **The installer builds the plugin from the marketplace's GitHub main** (or a
+  named ref), stamps its commit, and refuses to run while MultiTerminal is open.
+
+### Changed
+
+- **MultiTerminal runs on .NET 10 (LTS)** instead of .NET 8, which reaches end of
+  support on 10 November 2026. Building needs the .NET 10 SDK.
+- **Node.js 22.13 or newer now works; 24 LTS is still recommended** (GH #50).
+  The plugin's hooks fall back to Node's built-in SQLite when their bundled
+  database binary (built for Node 24) cannot load, so the installer now warns
+  only below 22.13 instead of on every version other than 24.
+
 ## [3.0.0] — 2026-10-30
 
 Major release: Claude profiles keep work and personal projects apart, and

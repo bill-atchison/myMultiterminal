@@ -1,3 +1,16 @@
+---
+paths:
+  - Services/LaunchCommandBuilder.cs
+  - MCPServer/Services/SessionCatalog.cs
+  - Services/LaunchSessionChoice.cs
+  - Services/PaneLaunch*.cs
+  - Services/HelperResume.cs
+  - Services/StartupRestore.cs
+  - Dialogs/LaunchSession*
+  - Dialogs/StartupRestore*
+  - Docking/TerminalDocument.cs
+---
+
 # Project launch: new session, continue last, or resume a past one
 
 Task **ec2ed636** (2026-10-17). Read this before changing `MainForm.OnStartScreenProjectLaunched`,
@@ -71,10 +84,24 @@ with `—` context or its fallback summary. The 256KB head and 64KB tail are alw
 
 `session_lineage` has no rows for spawned helpers and its `session_file_path` goes stale when Claude
 Code moves a transcript into a worktree's folder. `SessionCatalog` therefore reads Claude Code's own
-folders: `~/.claude/projects/<encoded root>` and every `<encoded root>--claude-worktrees-*` (plus `<encoded repo root>--claude-worktrees-*` for a project below its repo root, ticket 3fd3c9a7). Encoding
+folders: `<profile config dir>\projects\<encoded root>` (GitHub #97: the dir is the PROJECT'S Claude profile, see below) and every `<encoded root>--claude-worktrees-*` (plus `<encoded repo root>--claude-worktrees-*` for a project below its repo root, ticket 3fd3c9a7). Encoding
 is `[^A-Za-z0-9] -> '-'`. It reads only a bounded head and tail of each transcript and caps the number
 of transcripts read. Agent names and summaries come from injected DB lookups, with the transcript as
 fallback.
+
+**The root is the project's Claude profile (GH #97, ticket c4bf09ca).** `MainForm.CreateSessionCatalog(project, out refusal)`
+takes `ClaudeProfileDataRoots.ForProject(project.Id, null, ...)` + `projects`: the same project-row decision the launch
+makes (`TryGetLaunchClaudeProfile(project.Id, null)`, and `DecideLaunchClaudeProfile(project.Id, cwd, ...)` for a resumed
+helper), so a session is offered only if the profile the launch runs under can resume it. Claude finds a session only in
+its own config dir; a Default-folder session offered to a Work project failed with "No conversation found". No site builds
+a `.claude` path. A profile that cannot be honoured (not configured, folder missing, owners disagree, no registry) gives NO
+catalog and a reason, never Default's folder: the launch dialog shows it through the load-failure message, a helper is
+skipped with it, a startup-restore row is skipped with it. A decided profile whose folder does not exist yet (Default on a machine where Claude Code has never run) is NOT a refusal: `SessionRootForProject` gives its path with `FolderExists` false, the catalog is empty and the launch is a silent new session; nothing is created. A named profile with a missing folder IS a refusal (`Resolve` blocks it). The Default profile resolves as before, including an inherited
+`CLAUDE_CONFIG_DIR`. Every transcript path after that (`TryGetTranscriptWriteUtc`, `RecheckResume`, `HelperResume.Check`)
+is the catalog entry's own `TranscriptPath`, so it follows the same root; none builds a path. The launch's profile and the
+catalog's root cannot differ for a project launch because both read the project row; "Launch as" is the identity
+picker's restart and has no session choice, and a helper resumed with its PM names the project, so the row decides.
+Pinned by `ClaudeProfileDataRootsTests` (the `A_project_on_a_second_profile...` group).
 
 **Background gloss writers are never offered (GH #67).** The headless gloss writer
 (`MainForm.SpawnGlossWriterAsync`, see checklist-graph.md) starts in the app directory, which lies inside
@@ -93,7 +120,16 @@ so the prompt text is the only evidence on disk. The same prompt typed in an int
 - **The resume cwd is the transcript's own folder.** Claude finds a session only from the directory
   it was started in. `ResolveCwd` returns only a recorded cwd that encodes to the transcript's folder
   (or the project root for the root's own folder); anything else drops the session rather than
-  offering one that fails with "No conversation found".
+  offering one that fails with "No conversation found". A validated cwd BELOW a worktree
+  (`<base>\.claude\worktrees\<id>\tests\X`, base = project root or `WorktreeBase`) also yields its
+  worktree root, re-validated and used only if that root encodes to the folder (task 056bc6b6: a 46 MB
+  transcript whose 64KB tail held only subfolder cwds was dropped). This derives from a validated cwd,
+  never from the folder name. Order: exact in tail, derived from tail, exact in head, derived from
+  head, then the root fallback. A derived cwd still goes through `BeganInProject` when admitted only
+  through the repo root. The encoding is lossy (`foo-bar` and `foo_bar` share a folder), so for a
+  worktree folder the existing worktrees under the project root and `WorktreeBase` are listed once per
+  call (`WorktreesNamingFolder`): two or more naming the folder refuse the transcript ("matches more
+  than one worktree"), exactly one admits only cwds inside it, and a failed listing refuses.
 - **Transcript content is untrusted.** `ValidateResumeCwd` checks the cwd *as a string* before any
   filesystem call: a local drive path, canonicalised, equal to the project root or under
   `<root>\.claude\worktrees\<id>`, or, for a project registered at a SUBFOLDER of its git repo (ClarionAssistant), under `<repo root>\.claude\worktrees\<id>` (ticket 3fd3c9a7; the repo root is `SessionCatalog.FindRepoRoot` of the project root, used only as a strict non-drive ancestor, and carried on the entry as `WorktreeBase` so the re-checks use the same one). The repo-root worktrees are shared by every project in the repo, so a session admitted only through the repo root must also have BEGUN in this project: its first recorded cwd is exactly the project root (not below it: a registered project nested inside it would otherwise be offered here too), else it is skipped as "began in another project's folder of the same repository" (Codex review). A helper whose transcript starts directly in a repo-root worktree is therefore not offered (fail closed). A UNC path would otherwise make Windows authenticate to a remote
@@ -114,6 +150,51 @@ so the prompt text is the only evidence on disk. The same prompt typed in an int
   `StartTerminal`. A held name comes back suffixed, and the pane shows the actual name.
 - **`--resume`, never `--continue`.** `--continue` picks the newest session in the cwd, which may be
   live, and cannot reach worktree sessions.
+
+## Which model a launch uses (ticket b0d2f090)
+
+Owner report 2026-11-03: resuming a session ran on Fable, because Claude Code keeps the model stored in a
+session's transcript on `--resume` unless `--model` or `ANTHROPIC_MODEL` overrides it. Owner decisions: a
+resume uses the CONFIGURED model, overriding the transcript's; the defaults are Opus for project panes,
+Sonnet for helpers, Sonnet for subagents; they are settings, because Anthropic's models change.
+
+- **One decision.** `ClaudeModelLaunchPolicy.Decide` (pure, `Services/`), reached from every launch site
+  through `MainForm.DecideLaunchClaudeModel`, which only reads the project row and the settings and passes
+  them in. No site reads a setting itself. Order, first match wins: spawn_helper's model (helpers only);
+  a helper: the project's `claude_helper_model`, then Settings > General "Helper model"; a project pane:
+  the project's `claude_model`, then "Project model"; then the built-in default (`opus` / `sonnet`).
+  `default` at any level means no `--model` flag. Subagent model: Settings only (`sonnet` unless set).
+- **Roles.** Launch Project (new or resume), Just Claude, Launch as and New Project are project panes.
+  spawn_helper, a headless agent and a helper resumed with its PM (`ResumeHelpersInto`) are helpers: a
+  helper resumed with its PM must keep using the helper branch, or it would silently run on the PM's model.
+- **The flag.** `LaunchCommandBuilder.BuildClaudeCommand(..., model)` writes ` --model <name>` after the
+  flags and before `--resume`, so the command still starts with the bare `claude` token that
+  `ConPtyTerminal.ApplySessionName` splices `-n` after. No model gives exactly the command built before.
+  Just Claude builds its command before the folder is known and adds the flag with `WithModel`.
+- **Names are untrusted.** A name comes from settings, a project row or an agent's spawn_helper call and
+  lands on a PowerShell command line. The only gate is `ClaudeModelLaunchPolicy.IsValidModelName` (letters,
+  digits, dots, hyphens, optional `[1m]`, anchored with `\z`). The builder throws on anything else. An
+  invalid REQUESTED name makes spawn_helper fail with a 400 and creates no pane; an invalid STORED name
+  is skipped with a warning in the "ClaudeModel" debug log (naming the value and where it was stored)
+  and the next level decides: project row, then Settings, then the built-in model. It is never "no
+  flag", which on a resume would bring back the transcript's model. Only the explicit `default`
+  setting means no flag. The launch is not refused (the model is not an isolation boundary like a
+  Claude profile). An invalid subagent setting uses the built-in subagent model.
+- **Not covered.** The gloss writer stays `--model haiku` and gets no subagent variable. Codex panes get no
+  flag. Oracle hand-builds its command and runs on Claude Code's default. ClarionAssistant IDE tabs are
+  launched by CA, not MT, so none of this reaches them (they need their own CA ticket; `ANTHROPIC_MODEL`
+  stays as the stopgap there).
+- **Subagents.** `CLAUDE_CODE_SUBAGENT_MODEL` is set beside the profile prologue (panes) and in
+  `AgentProcess.ApplyEnvironment` (headless); when no subagent model is decided (the `default` setting or an
+  invalid stored name) it is CLEARED (`$null` / removed), because MT's own environment is inherited. Per the Claude Code docs it does not change the built-in
+  Explore and Plan agents, and an agent's frontmatter or the Agent tool's model parameter outrank it.
+- **Header.** The pane header's model badge (`statusbar.html .sl-model`) turns amber for Fable.
+- **Preferred Model.** `team_member_profiles.preferred_model` and `project_agents.preferred_model` still
+  exist but nothing reads them; the UI, the roster endpoints and the roster MCP text no longer show them.
+- **Not executed live.** The suite covers the decision, the flag, the name gate and the environment
+  assignments. That each MainForm site passes the decision on, and that Claude Code honours `--model` on
+  `--resume`, were not run. Check by resuming a session last run on another model and reading the model
+  of its new turns in the transcript.
 
 ## Helpers resume with their PM (task 7d20e94c)
 

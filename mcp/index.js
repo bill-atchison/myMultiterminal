@@ -10,6 +10,8 @@ import { readFileSync } from "fs";
 import { execFile } from "child_process";
 import { fileURLToPath } from "url";
 import path from "path";
+import { formatTasks } from "./lib/task-formatters.mjs";
+import { formatClaudeUsage } from "./lib/context-formatters.mjs";
 
 const API_BASE = "http://localhost:5050";
 
@@ -365,6 +367,27 @@ async function resolveNotesProject(args) {
   };
 }
 
+// GitHub #92: a task's Pending/Coding/Testing/Done view is built from its checklist, and agents often
+// activate a task, or write its plan as prose, without adding any items, leaving that view empty until
+// the Owner notices. set_task_active, claim_task and update_task_plan append this note when the task
+// has none. Advisory only: it never blocks, and a failed lookup adds nothing.
+const EMPTY_CHECKLIST_NOTE =
+  "📋 This task has no checklist yet, so its Pending/Coding/Testing/Done view is empty. " +
+  "Add the steps with append_checklist_items before you start coding.";
+
+async function emptyChecklistNote(taskId, fetchDetail) {
+  try {
+    const detail = await fetchDetail(taskId);
+    const total = detail?.checklistSummary?.total;
+    return total === 0 ? `\n${EMPTY_CHECKLIST_NOTE}` : "";
+  } catch {
+    return "";
+  }
+}
+
+const fetchTaskDetail = (taskId) => apiCall(`/api/tasks/${seg(taskId)}/detail`);
+// End of the #92 checklist note.
+
 // compact_my_context byte cap (ticket c0ebcfd4). TerminalControl.InjectInputAsync splits any injected
 // text over 500 UTF-8 bytes into chunks prefixed "[1/2] ", "[2/2] " and submits each separately, so a
 // long "/compact <focus>" arrives as a plain message ("[1/2] /compact ...", not a command) and the rest
@@ -485,33 +508,6 @@ function formatInbox(data) {
   return output.trim();
 }
 
-// Format task list for display
-function formatTasks(tasks) {
-  if (!tasks || tasks.length === 0) {
-    return "No tasks found.";
-  }
-
-  let output = "Tasks:\n";
-  tasks.forEach(t => {
-    const statusIcon = {
-      'todo': '📋',
-      'in_progress': '🔄',
-      'done': '✅',
-      'suggestion': '💡'
-    }[t.status] || '•';
-
-    output += `${statusIcon} [${t.id.substring(0, 8)}] ${t.title} (${t.status})`;
-    if (t.assignee) output += ` [${t.assignee}]`;
-    output += "\n";
-    if (t.description) {
-      const desc = t.description.length > 120 ? t.description.substring(0, 120) + "..." : t.description;
-      output += `   ${desc}\n`;
-    }
-  });
-
-  return output.trim();
-}
-
 const server = new Server(
   {
     name: "multiterminal-mcp",
@@ -598,7 +594,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "list_tasks",
-        description: "List kanban tasks from the MultiTerminal board. In a project terminal this defaults to the CURRENT PROJECT's tasks (resolved from CLAUDE_PROJECT_DIR); pass projectId:\"all\" for the full cross-project board. Quick-tasks (lightweight attribution anchors for trivial changes) are hidden by default; pass includeQuickTasks=true to include them (e.g., for the Quick-Tasks audit view).",
+        description: "List kanban tasks from the MultiTerminal board as a compact one-line summary per task (id, title, status, priority, and assignee when set). Pass includeDescriptions=true for description previews. In a project terminal this defaults to the CURRENT PROJECT's tasks (resolved from CLAUDE_PROJECT_DIR); pass projectId:\"all\" for the full cross-project board. Quick-tasks (lightweight attribution anchors for trivial changes) are hidden by default; pass includeQuickTasks=true to include them (e.g., for the Quick-Tasks audit view).",
         inputSchema: {
           type: "object",
           properties: {
@@ -610,6 +606,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             includeQuickTasks: {
               type: "boolean",
               description: "If true, include quick-tasks (is_quick_task=1 immutable attribution anchors). Default false keeps the kanban board view clean.",
+              default: false,
+            },
+            includeDescriptions: {
+              type: "boolean",
+              description: "If true, add the previous description-preview line beneath each task. Default false keeps each task to one compact line.",
               default: false,
             },
             projectId: {
@@ -1134,6 +1135,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               description: "Registered project id; the helper starts in that project's source path. Optional.",
             },
+            model: {
+              type: "string",
+              description: "The model the helper starts on: an alias (\"opus\", \"sonnet\", \"haiku\", \"fable\"), a full model name, or \"default\" for Claude Code's own default. Optional. Omitted, the helper uses the project's helper model, else the Helper model in MultiTerminal's Settings (Sonnet unless changed). Letters, digits, dots and hyphens only, with an optional [1m] suffix; anything else is refused and no pane is created.",
+            },
             initialPrompt: {
               type: "string",
               description: "The helper's job. Handed over as ONE prompt that the helper collects itself (get_my_spawn_job) within seconds of booting; the 120s elsewhere is the give-up bound, not the expected wait. Line breaks are kept. Optional — without it the helper boots and waits, idle, for someone to tell it what to do.",
@@ -1439,7 +1444,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       // Team Assembly Tools
       {
         name: "get_team_roster",
-        description: "Get the team roster for a project with merged profile data (preferred_model, agent_instructions, role, skills). Use this to discover which agents to spawn for a team assembly workflow.",
+        description: "Get the team roster for a project with merged profile data (agent_instructions, role, skills). Use this to discover which agents to spawn for a team assembly workflow.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1589,7 +1594,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             preferredModel: {
               type: "string",
-              description: "Preferred Claude model: opus, sonnet, haiku",
+              description: "Stored on the agent row only. No launch reads it: models come from the project's Model and Helper model settings and MultiTerminal's Settings (ticket b0d2f090).",
             },
           },
           required: ["projectId", "agentName"],
@@ -2999,7 +3004,6 @@ function formatProject(ctx) {
     ctx.agents.forEach(a => {
       text += `  • ${a.agentName}`;
       if (a.role) text += ` (${a.role})`;
-      if (a.preferredModel) text += ` [${a.preferredModel}]`;
       text += "\n";
     });
   }
@@ -3086,7 +3090,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let url = `/api/tasks?status=${encodeURIComponent(status)}&includeQuickTasks=${encodeURIComponent(includeQuickTasks)}`;
         if (projectId) url += `&projectId=${encodeURIComponent(projectId)}`;
         const tasks = await apiCall(url);
-        let text = formatTasks(tasks);
+        let text = formatTasks(tasks, args.includeDescriptions === true);
         if (projectId) {
           text = `(scoped to project ${projectId} — pass projectId:"all" for every project)\n${text}`;
         }
@@ -3229,11 +3233,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
         await apiCall(`/api/tasks/${seg(args.taskId)}/assign`, "POST", body);
+        const claimNote = await emptyChecklistNote(args.taskId, fetchTaskDetail);
         return {
           content: [
             {
               type: "text",
-              text: `✅ Task ${args.taskId} claimed by ${args.assignee}${args.reassign === true ? " (reassigned)" : ""}`,
+              text: `✅ Task ${args.taskId} claimed by ${args.assignee}${args.reassign === true ? " (reassigned)" : ""}${claimNote}`,
             },
           ],
         };
@@ -3618,8 +3623,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           plan: args.plan,
           updatedBy: args.updatedBy,
         });
+        const planNote = await emptyChecklistNote(args.taskId, fetchTaskDetail);
         return {
-          content: [{ type: "text", text: `✅ Plan updated for task ${args.taskId}` }],
+          content: [{ type: "text", text: `✅ Plan updated for task ${args.taskId}${planNote}` }],
         };
       }
 
@@ -3642,6 +3648,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (result.pausedTaskIds && result.pausedTaskIds.length > 0) {
           text += `\nAuto-paused ${result.pausedTaskIds.length} task(s): ${result.pausedTaskTitles.join(", ")}`;
         }
+        text += await emptyChecklistNote(args.taskId, fetchTaskDetail);
         return {
           content: [{ type: "text", text }],
         };
@@ -3731,7 +3738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const ctxQs = ctxDocId ? `?docId=${encodeURIComponent(ctxDocId)}` : "";
         const stats = await apiCall(`/api/terminals/${seg(ctxName)}/stats` + ctxQs);
         if (!stats || stats.available === false) {
-          return { content: [{ type: "text", text: `No live context stats for '${ctxName}' yet (terminal not reporting). Try again after a turn or two.` }] };
+          return { content: [{ type: "text", text: `No live context stats for '${ctxName}' yet (terminal not reporting). Try again after a turn or two.\n${formatClaudeUsage(stats)}` }] };
         }
         const threshold = parseInt(process.env.MULTITERMINAL_CONTEXT_THRESHOLD || "70", 10);
         const ctx = stats.contextPercent;
@@ -3743,11 +3750,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? `⚠️ At/over the ${threshold}% nudge threshold — finish your current step, write continuation notes (update_task_continuation), then call clear_my_context at a clean boundary.\n`
             : `✅ Headroom remaining (nudge threshold ${threshold}%).\n`;
         }
-        if (stats.fiveHourPercent != null || stats.sevenDayPercent != null) {
-          ctxText += `Quota — 5h: ${stats.fiveHourPercent ?? "?"}%  7d: ${stats.sevenDayPercent ?? "?"}%`;
-          if (stats.quotaStale) ctxText += " (stale)";
-          ctxText += "\n";
-        }
+        ctxText += formatClaudeUsage(stats);
+        if (stats.quotaStale) ctxText += " (stale)";
+        ctxText += "\n";
         if (stats.tokensTotal != null) {
           ctxText += `Tokens: ${stats.tokensTotal.toLocaleString()}`;
           if (stats.costUsd != null) ctxText += `  (~$${stats.costUsd}${stats.costIsEstimate ? " est" : ""})`;
@@ -3987,6 +3992,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           projectId: args.projectId || null,
           initialPrompt: args.initialPrompt || null,
           spawnerName: String(args.spawnerName).trim(),
+          model: args.model ? String(args.model).trim() : null,
         }, API_TIMEOUT_MS, spawnerNonce ? { "X-MultiTerminal-Launch-Nonce": spawnerNonce } : null);
 
         // What the API's success means: the PANE exists and its identity is registered. The helper
@@ -4440,14 +4446,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } else {
           result.agents.forEach(a => {
             const profileIcon = a.hasProfile ? "✅" : "⚠️";
-            const modelIcon = { opus: "🟣", sonnet: "🔵", haiku: "🟢" }[a.preferredModel] || "⚪";
             text += `${profileIcon} ${a.name}`;
             if (a.isTeamLead) text += ` | Team Lead`;
             text += "\n";
-            text += `   Model: ${modelIcon} ${a.preferredModel}`;
-            if (a.role) text += ` | Role: ${a.role}`;
-            if (a.isOnline) text += ` | 🟢 Online`;
-            text += "\n";
+            const detail = [];
+            if (a.role) detail.push(`Role: ${a.role}`);
+            if (a.isOnline) detail.push("🟢 Online");
+            if (detail.length > 0) text += `   ${detail.join(" | ")}\n`;
             if (a.skills && a.skills.length > 0) text += `   Skills: ${a.skills.join(", ")}\n`;
             if (a.agentInstructions) text += `   Instructions: ${a.agentInstructions.substring(0, 100)}${a.agentInstructions.length > 100 ? "..." : ""}\n`;
             if (!a.hasProfile) text += `   ⚠️ No profile found - will spawn with defaults\n`;

@@ -233,6 +233,10 @@ namespace MultiTerminal.Docking
         /// Read by "Launch as..." to keep the pane's Quiet start setting (GitHub #34).</summary>
         public string LaunchProjectId => _launchProjectId;
 
+        /// <summary>The role this pane's current launch was given (PM, helper or none). Read by the
+        /// "project already open" question (GitHub #95), which counts only the Owner's own PM panes.</summary>
+        internal MultiTerminal.Terminal.TerminalRole LaunchRole => _terminalRole;
+
         /// <summary>The name of the Claude profile this pane was last launched under (ticket c8ee0eec);
         /// null for Default or a pane that has not launched. Read when a launch lands in a folder no
         /// project owns: by "Launch as..." (the pane keeps its profile) and for a helper this pane spawns
@@ -420,7 +424,8 @@ namespace MultiTerminal.Docking
 
         /// <summary>
         /// A link on the header's GitHub band was clicked (task e4924065): which page ("repo", "issues"
-        /// or "pulls") of which project's repo. MainForm builds the URL and opens the browser.
+        /// or "pulls") of which project's repo. MainForm builds the URL and opens the browser. The
+        /// failure link (task 81d0e597) sends "accounts" or "project" instead, and MainForm opens that form.
         /// </summary>
         public event EventHandler<GitHubLinkRequestedEventArgs> GitHubLinkRequested;
 
@@ -430,9 +435,16 @@ namespace MultiTerminal.Docking
         /// </summary>
         public event EventHandler<string> SettingsProjectChanged;
 
-        /// <summary>Shows or hides the header's GitHub band (task e4924065). A null repo hides it.</summary>
-        public void SetGitHubBand(string repoFullName, int? openIssues, int? openPullRequests) =>
-            _statusBar?.SetGitHub(repoFullName, openIssues, openPullRequests);
+        /// <summary>Shows or hides the header's GitHub band (task e4924065). A null band or repo hides it.</summary>
+        public void SetGitHubBand(Services.GitHubBand band) => _statusBar?.SetGitHub(band);
+
+        /// <summary>
+        /// Ticket 37edc158: pushes the pane's launch profile to the header, which shows it only when it is
+        /// not Default. The renderer remembers the value and replays it when its page loads, so a launch
+        /// that begins before the header page is ready is not lost.
+        /// </summary>
+        private void ShowClaudeProfileInHeader() =>
+            _statusBar?.SetClaudeProfile(Services.PaneProfileBadge.For(_launchClaudeProfile?.ProfileName, Services.ClaudeProfileResolver.CurrentContext()));
 
         /// <summary>
         /// The project the status bar's gear opens: the registered project containing the pane's folder,
@@ -444,6 +456,7 @@ namespace MultiTerminal.Docking
         /// Function to retrieve available identity names for the "Launch as..." menu.
         /// Set by MainForm to provide identity list.
         /// </summary>
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public Func<string[]> GetAvailableIdentities { get; set; }
 
         // Split ratios for splitter containers (global, applied from settings)
@@ -559,6 +572,7 @@ namespace MultiTerminal.Docking
         /// Gets or sets the pending working directory for session restore.
         /// Set this before the terminal is started during layout restoration.
         /// </summary>
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public string PendingWorkingDirectory
         {
             get => _pendingWorkingDirectory;
@@ -583,6 +597,7 @@ namespace MultiTerminal.Docking
         /// Gets or sets a custom user-defined title for the tab.
         /// When set, this overrides the automatic title from the working directory.
         /// </summary>
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public string CustomTitle
         {
             get => _customTitle;
@@ -1568,11 +1583,13 @@ namespace MultiTerminal.Docking
         /// <param name="resumeSessionId">The Claude session this launch resumes (task ec2ed636), reserved for the pane from the first instant; null for a new session.</param>
         /// <param name="launchKind">The <see cref="PaneLaunchKind"/> of this launch, for the launch record, when the caller knows it (pipeline Run 1, task 7d20e94c). Null derives it from <paramref name="autoRunCommand"/>.</param>
         /// <param name="launchQuietStart">Quiet start whatever the project says ("Just Claude", ticket ae3d0193). A helper is still never quiet.</param>
-        public void StartTerminal(string workingDirectory = null, string terminalName = null, string autoRunCommand = null, string spawnerName = null, string projectId = null, bool isTeamLead = false, string gatewayProfile = null, string taskWorktreePath = null, string quietStartProjectId = null, MultiTerminal.Models.ClaudeProfile claudeProfile = null, string resumeSessionId = null, string launchKind = null, bool launchQuietStart = false)
+        /// <param name="subagentModel">The model for CLAUDE_CODE_SUBAGENT_MODEL (ticket b0d2f090), from <see cref="MultiTerminal.Services.ClaudeModelLaunchPolicy"/>; null sets none. Reset on every launch.</param>
+        public void StartTerminal(string workingDirectory = null, string terminalName = null, string autoRunCommand = null, string spawnerName = null, string projectId = null, bool isTeamLead = false, string gatewayProfile = null, string taskWorktreePath = null, string quietStartProjectId = null, MultiTerminal.Models.ClaudeProfile claudeProfile = null, string resumeSessionId = null, string launchKind = null, bool launchQuietStart = false, string subagentModel = null)
         {
             // Per launch, like the role below: a reused pane must not keep the last launch's profile.
             _launchClaudeProfile = new MultiTerminal.Services.ClaudePaneProfile(
                 claudeProfile == null || claudeProfile.IsDefault ? null : claudeProfile.Name);
+            ShowClaudeProfileInHeader();
             _debugLogService?.Info("TerminalDocument.StartTerminal", $"===== START =====");
             _debugLogService?.Trace("TerminalDocument.StartTerminal", $"workingDirectory: '{workingDirectory ?? "null"}'");
             _debugLogService?.Trace("TerminalDocument.StartTerminal", $"terminalName: '{terminalName ?? "null"}'");
@@ -1666,6 +1683,7 @@ namespace MultiTerminal.Docking
                     _debugLogService?.Error("TerminalDocument", $"Quiet start lookup threw for project '{quietProjectId}': {quietEx.Message}");
                 }
             }
+            _terminal.SubagentModel = subagentModel;
             _terminal.QuietStart = MultiTerminal.Terminal.TerminalRoles.IsQuietStart(projectQuietStart, spawnerName, launchQuietStart);
             _debugLogService?.Trace("TerminalDocument.StartTerminal", $"quietStart: '{_terminal.QuietStart}' (project setting '{projectQuietStart}', launch '{launchQuietStart}')");
 
@@ -2918,6 +2936,8 @@ namespace MultiTerminal.Docking
             _terminalAgentSplitter.Visible = false;
             if (_statusBarSplitter != null) _statusBarSplitter.Visible = false;
             _statusBar.Visible = false;
+            // Back on the start screen no launch is running, so the header shows no profile (ticket 37edc158).
+            _statusBar.SetClaudeProfile(null);
 
             // Show start screen over the entire content area
             _startScreen.BringToFront();

@@ -33,11 +33,19 @@ namespace MultiTerminal.Services
         /// Claude Code session id to resume (<c>--resume &lt;id&gt;</c>), or null/whitespace for a fresh
         /// session. Must be a GUID; anything else throws <see cref="ArgumentException"/> (task ec2ed636).
         /// </param>
+        /// <param name="model">
+        /// The model for <c>--model</c> (ticket b0d2f090), already decided by <see cref="ClaudeModelLaunchPolicy"/>,
+        /// or null for no flag, which gives exactly the command this method built before the parameter existed.
+        /// The name goes onto a PowerShell command line, so a name the policy's allow-pattern rejects throws
+        /// <see cref="ArgumentException"/> rather than being quoted: the decision never hands one over, so reaching
+        /// the throw is a caller bug. A resume with a model overrides the model stored in the session's transcript.
+        /// </param>
         /// <returns>LaunchCommand with WorkingDirectory and AutoRunCommand ready for ConPtyTerminal.Start().</returns>
-        public static LaunchCommand BuildClaudeCommand(Models.Project project, string workingDirectory = null, string resumeSessionId = null)
+        public static LaunchCommand BuildClaudeCommand(Models.Project project, string workingDirectory = null, string resumeSessionId = null, string model = null)
         {
             // Validate first: a bad id must fail before BuildFlags writes the settings file.
             string resumeId = NormalizeResumeSessionId(resumeSessionId);
+            string modelFlag = FormatModelFlag(model);
 
             string workingDir = workingDirectory ?? ResolveWorkingDirectory(project);
 
@@ -52,7 +60,7 @@ namespace MultiTerminal.Services
             string launchArgs = ClaudeLaunchArgs(_claudeCommandSource?.Invoke(), ignored);
             if (ignored.Count > 0)
                 _log?.Warning("LaunchCommandBuilder", $"Ticked Claude command: ignored {string.Join(" ", ignored)} (see LaunchCommandBuilder.ClaudeLaunchArgs for what can be passed).");
-            string autoRunCommand = $"claude{flags}{resumeFlag}{launchArgs}; exit";
+            string autoRunCommand = $"claude{flags}{modelFlag}{resumeFlag}{launchArgs}; exit";
 
             return new LaunchCommand
             {
@@ -135,13 +143,50 @@ namespace MultiTerminal.Services
                     || t.StartsWith("--name=", StringComparison.Ordinal))
                 {
                     ignored?.Add(t);
-                    if (optionWithValue && i + 1 < tokens.Length && !tokens[i + 1].StartsWith("-", StringComparison.Ordinal))
+                    if (optionWithValue && i + 1 < tokens.Length && !tokens[i + 1].StartsWith('-'))
                         ignored?.Add(tokens[++i]);
                     continue;
                 }
                 args.Append(' ').Append(t);
             }
             return args.ToString();
+        }
+
+        /// <summary>
+        /// ` --model &lt;name&gt;` (leading space) for a validated model name, or an empty string for null.
+        /// Throws <see cref="ArgumentException"/> for a name <see cref="ClaudeModelLaunchPolicy.IsValidModelName"/>
+        /// rejects, so nothing outside the allow-pattern ever reaches the command line.
+        /// </summary>
+        internal static string FormatModelFlag(string model)
+        {
+            if (string.IsNullOrWhiteSpace(model))
+                return string.Empty;
+            if (!ClaudeModelLaunchPolicy.IsValidModelName(model))
+                throw new ArgumentException($"Model name is not valid for a command line: '{model}'.", nameof(model));
+            return $" --model {model}";
+        }
+
+        /// <summary>
+        /// Adds ` --model &lt;name&gt;` to a command <see cref="BuildClaudeCommand"/> already built, for
+        /// <c>MainForm.OnStartScreenJustClaude</c>, which builds the command before the folder (and so the model)
+        /// is known. The flag lands where <see cref="BuildClaudeCommand"/> puts it: after the flags, before
+        /// <c>--resume</c> and <c>--dangerously-skip-permissions</c>. Null returns the command unchanged.
+        /// </summary>
+        internal static string WithModel(string autoRunCommand, string model)
+        {
+            string modelFlag = FormatModelFlag(model);
+            if (modelFlag.Length == 0 || string.IsNullOrEmpty(autoRunCommand))
+                return autoRunCommand;
+
+            int at = autoRunCommand.IndexOf(" --resume ", StringComparison.Ordinal);
+            if (at < 0)
+                at = autoRunCommand.LastIndexOf(" --dangerously-skip-permissions", StringComparison.Ordinal);
+            // A ticked plain `claude` has neither flag (task 452d33a4), so the end of the command is the place.
+            if (at < 0 && autoRunCommand.EndsWith("; exit", StringComparison.Ordinal))
+                at = autoRunCommand.Length - "; exit".Length;
+            if (at < 0)
+                throw new ArgumentException("The command is not a Claude launch built by LaunchCommandBuilder.", nameof(autoRunCommand));
+            return autoRunCommand.Insert(at, modelFlag);
         }
 
         /// <summary>
@@ -364,7 +409,8 @@ namespace MultiTerminal.Services
         /// card split button) should use this instead of calling the per-kind
         /// builder directly.
         /// </summary>
-        public static LaunchCommand BuildCommand(Models.TerminalKind kind, Models.Project project, string workingDirectory = null, string resumeSessionId = null)
+        /// <param name="model">For a Claude launch, the decided model (see <see cref="BuildClaudeCommand"/>); Codex gets no model flag and ignores it.</param>
+        public static LaunchCommand BuildCommand(Models.TerminalKind kind, Models.Project project, string workingDirectory = null, string resumeSessionId = null, string model = null)
         {
             // workingDirectory: explicit cwd for callers that know it (API-driven spawn); null
             // resolves from the project. See BuildClaudeCommand for why this is load-bearing.
@@ -379,7 +425,7 @@ namespace MultiTerminal.Services
                     return BuildCodexCommand(project, workingDirectory);
                 case Models.TerminalKind.ClaudeCode:
                 default:
-                    return BuildClaudeCommand(project, workingDirectory, resumeSessionId);
+                    return BuildClaudeCommand(project, workingDirectory, resumeSessionId, model);
             }
         }
 
@@ -660,9 +706,7 @@ namespace MultiTerminal.Services
                 string json = merged.ToJsonString();
 
                 // Per-user-private dir, not the shared temp root.
-                string dir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "MultiTerminal");
+                string dir = GetForcedStatuslineDirectory();
                 Directory.CreateDirectory(dir);
                 // The merged content is now PER-PROJECT (it carries that project's local settings),
                 // so key the file by a stable hash of the working dir to avoid cross-project
@@ -699,6 +743,55 @@ namespace MultiTerminal.Services
                     $"[LaunchCommandBuilder] Forced statusLine skipped (settings write failed): {ex.Message}. " +
                     "Context may stay '--%' for project terminals that override statusLine.");
                 return (string.Empty, false);
+            }
+        }
+
+        /// <summary>Returns the per-user directory that holds forced-statusline settings files.</summary>
+        internal static string GetForcedStatuslineDirectory() =>
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "MultiTerminal");
+
+        /// <summary>
+        /// Best-effort removal of atomic-write temporary files left behind by an interrupted launch.
+        /// </summary>
+        internal static int SweepStaleForcedStatuslineTempFiles(
+            string directory,
+            TimeSpan maxAge,
+            DateTime currentUtc)
+        {
+            try
+            {
+                if (!Directory.Exists(directory))
+                    return 0;
+
+                string[] candidates = Directory.GetFiles(
+                    directory,
+                    "forced-statusline-*.settings.json.*.tmp",
+                    SearchOption.TopDirectoryOnly);
+                int deleted = 0;
+                foreach (string candidate in candidates)
+                {
+                    try
+                    {
+                        if (currentUtc - File.GetLastWriteTimeUtc(candidate) <= maxAge)
+                            continue;
+
+                        File.Delete(candidate);
+                        deleted++;
+                    }
+                    catch
+                    {
+                        // A locked or inaccessible orphan must not stop the remaining sweep.
+                    }
+                }
+
+                return deleted;
+            }
+            catch
+            {
+                // Missing/inaccessible directories and enumeration failures are best-effort no-ops.
+                return 0;
             }
         }
 

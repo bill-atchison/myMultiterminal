@@ -112,6 +112,9 @@ namespace MultiTerminal.Services
 
         private const string LastDirectoryKey = "LastDirectory";
         private const string LastNewProjectQuietStartKey = "LastNewProjectQuietStart";
+        private const string ClaudeProjectModelKey = "ClaudeProjectModel";
+        private const string ClaudeHelperModelKey = "ClaudeHelperModel";
+        private const string ClaudeSubagentModelKey = "ClaudeSubagentModel";
         private const string DefaultWorkingDirectoryKey = "DefaultWorkingDirectory";
         private const string RecentDirectoriesKey = "RecentDirectories";
         private const int MaxRecentDirectories = 10;
@@ -162,8 +165,12 @@ namespace MultiTerminal.Services
         private const string DefaultAgentPanelLayout = "SplitRight";
 
         // Agent panel close mode settings
-        private const string AgentPanelCloseModeKey = "AgentPanelCloseMode";
-        private const string DefaultAgentPanelCloseMode = "ManualClose";
+        // GH #89: the setting was saved but never read, and the dialog wrote its old default
+        // (ManualClose) on every OK, so a stored "AgentPanelCloseMode" says nothing about what anyone
+        // chose. Honouring it now would switch those installs to Keep open unasked; a new key starts
+        // everyone on AutoClose, which is what MT has always done.
+        private const string AgentPanelCloseModeKey = "AgentPanelOnComplete";
+        private const string DefaultAgentPanelCloseMode = "AutoClose";
 
         // Status bar height setting
         private const string StatusBarHeightKey = "StatusBarHeight";
@@ -873,8 +880,8 @@ namespace MultiTerminal.Services
         public string GetAgentPanelCloseMode()
         {
             string value = Get(AgentPanelCloseModeKey);
-            if (value == "AutoClose")
-                return "AutoClose";
+            if (value == "AutoClose" || value == "ManualClose")
+                return value;
             return DefaultAgentPanelCloseMode;
         }
 
@@ -1435,6 +1442,38 @@ namespace MultiTerminal.Services
         public void SetDefaultWorkingDirectory(string path)
         {
             Set(DefaultWorkingDirectoryKey, path ?? "");
+        }
+
+        /// <summary>
+        /// The three Claude model settings (ticket b0d2f090): Project model, Helper model, Subagent model.
+        /// A key never stored reads as null, which <see cref="ClaudeModelLaunchPolicy"/> turns into its
+        /// built-in default (opus, sonnet, sonnet), so a fresh install and an existing machine agree. The
+        /// value "default" means Claude Code's own default (no flag). This is the only reader of the keys;
+        /// launch sites ask the policy, not these.
+        /// </summary>
+        public ClaudeModelSettingsValues GetClaudeModelSettings() => new ClaudeModelSettingsValues
+        {
+            GlobalProjectModel = ClaudeModelLaunchPolicy.Normalize(Get(ClaudeProjectModelKey)),
+            GlobalHelperModel = ClaudeModelLaunchPolicy.Normalize(Get(ClaudeHelperModelKey)),
+            GlobalSubagentModel = ClaudeModelLaunchPolicy.Normalize(Get(ClaudeSubagentModelKey)),
+        };
+
+        /// <summary>
+        /// Stores the three model settings. A blank value removes the key (back to the built-in default).
+        /// The caller validates names first (<see cref="ClaudeModelLaunchPolicy.IsValidModelName"/>); a
+        /// stored invalid name is still harmless, because the launch policy re-checks it.
+        /// </summary>
+        public void SetClaudeModelSettings(string projectModel, string helperModel, string subagentModel)
+        {
+            SetOrRemoveModel(ClaudeProjectModelKey, projectModel);
+            SetOrRemoveModel(ClaudeHelperModelKey, helperModel);
+            SetOrRemoveModel(ClaudeSubagentModelKey, subagentModel);
+        }
+
+        private void SetOrRemoveModel(string key, string value)
+        {
+            string name = ClaudeModelLaunchPolicy.Normalize(value);
+            if (name == null) Remove(key); else Set(key, name);
         }
 
         /// <summary>

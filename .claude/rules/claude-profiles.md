@@ -1,3 +1,12 @@
+---
+paths:
+  - Services/ClaudeProfile*.cs
+  - Models/ClaudeProfile.cs
+  - Services/TeamWatcherService.cs
+  - Terminal/ConPtyTerminal.cs
+  - Dialogs/IdentityPicker*
+---
+
 # Claude profiles: which CLAUDE_CONFIG_DIR a terminal runs under
 
 Ticket **c8ee0eec** (GitHub #21). Read this before changing a launch path, the launch prologue,
@@ -124,6 +133,8 @@ of the machine (`SettingsService`, key `ClaudeProfiles`); a project stores a pro
    and the FOLDER's profile is used, but only if that pane runs under the same profile
    (`SessionContextWriter.SameContextRoot`); otherwise nothing is written.
 
+   The resume session catalog (launch dialog, Continue last, helper resume, startup restore) is the project-row case (GitHub #97): `MainForm.CreateSessionCatalog(project, out refusal)` asks `ForProject(project.Id, null, ..., out reason)`, the launch's own decision, and a null root is no catalog plus the reason, never Default. See launch-session-choice.md.
+
    Still path-only, because no pane exists to ask: the startup session sync and crash-recovery
    indexing and the periodic sync (MainForm, over registered projects); `SessionSyncService` and `SessionDiscovery` (a project path, or every root);
    `SessionLineageService.GetUnsummarizedSessions`; `SessionMemoryDatabase.FindUnindexedSessions`;
@@ -150,6 +161,12 @@ of the machine (`SettingsService`, key `ClaudeProfiles`); a project stores a pro
 10. **Comparisons are one rule.** Profile names: `ClaudeProfile.NormalizeName`, then
     ordinal-ignore-case (blank and `Default` are the same). Folders:
     `ClaudeProfileResolver.Canonicalize`, then ordinal-ignore-case. Use those two, not a local trim.
+
+**Related but separate: the launch's model (ticket b0d2f090).** `CLAUDE_CODE_SUBAGENT_MODEL` is appended in
+`ConPtyTerminal.StartProcess` right after the `BuildClaudeEnvSetup` call, from a separate helper
+(`BuildSubagentModelAssignment`) and the pane's `SubagentModel` property. It is NOT folded into
+`BuildClaudeEnvSetup`, which still takes no command and still has the one parameter, so invariant 6 is
+unchanged. The model decision itself is `ClaudeModelLaunchPolicy`; see `launch-session-choice.md`.
 
 ## Owner decisions
 
@@ -187,7 +204,8 @@ of the machine (`SettingsService`, key `ClaudeProfiles`); a project stores a pro
 - **Session-memory search spans profiles.** `SessionMemoryDatabase` is one index with no profile
   column.
 - **Oracle always runs under Default.** `OracleTerminalForm.StartTerminal` passes no profile, and
-  it is not checked by the never-used guard.
+  it is not checked by the never-used guard. It also passes no `--model` (its command is hand-built in
+  `OracleService.BuildAutoRunCommand`), so it runs on Claude Code's own default.
 - **Sessions MT did not launch** (ClarionAssistant tabs, see `ca-embedded-sessions.md`) carry no
   profile.
 - **The MT plugin path is the Default profile's.** `LaunchCommandBuilder.MtPluginPathCandidates`

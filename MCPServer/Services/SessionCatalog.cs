@@ -283,8 +283,9 @@ namespace MultiTerminal.MCPServer.Services
 
             var live = ToLiveSet(liveSessionIds);
             var worktreeBase = WorktreeBaseFor(root);
+            var worktrees = ListWorktreeDirs(root, worktreeBase);
 
-            var candidates = new List<(string Path, string FolderName, DateTime LastWriteUtc)>();
+            var candidates =new List<(string Path, string FolderName, DateTime LastWriteUtc)>();
             foreach (var folder in GetCandidateFolders(root, worktreeBase))
             {
                 IEnumerable<string> files;
@@ -324,7 +325,7 @@ namespace MultiTerminal.MCPServer.Services
                     continue;
 
                 TranscriptsReadLastList++;
-                var entry = TryBuildEntry(root, worktreeBase, candidate.Path, candidate.FolderName, candidate.LastWriteUtc, utcNow, meter, out _);
+                var entry = TryBuildEntry(root, worktreeBase, worktrees, candidate.Path, candidate.FolderName, candidate.LastWriteUtc, utcNow, meter, out _);
                 BytesReadLastList = meter.Used;
                 if (entry != null)
                     results.Add(entry);
@@ -394,7 +395,7 @@ namespace MultiTerminal.MCPServer.Services
 
             if (newestPath == null)
                 return Miss("its transcript was not found in this project's session folders (it may have run in another project's folder)");
-            var entry = TryBuildEntry(root, worktreeBase, newestPath, newestFolder, newestWriteUtc, utcNow, new ReadMeter(ReadByteBudget), out var why);
+            var entry = TryBuildEntry(root, worktreeBase, ListWorktreeDirs(root, worktreeBase), newestPath, newestFolder, newestWriteUtc, utcNow, new ReadMeter(ReadByteBudget), out var why);
             return entry ?? Miss(why ?? "its transcript could not be read");
         }
 
@@ -497,12 +498,12 @@ namespace MultiTerminal.MCPServer.Services
             }
         }
 
-        private SessionCatalogEntry TryBuildEntry(string root, string worktreeBase, string path, string folderName, DateTime lastWriteUtc, DateTime utcNow, ReadMeter meter, out string missReason)
+        private SessionCatalogEntry TryBuildEntry(string root, string worktreeBase, IReadOnlyList<string> worktrees, string path, string folderName, DateTime lastWriteUtc, DateTime utcNow, ReadMeter meter, out string missReason)
         {
             missReason = null;
             try
             {
-                return BuildEntry(root, worktreeBase, path, folderName, lastWriteUtc, utcNow, meter, out missReason);
+                return BuildEntry(root, worktreeBase, worktrees, path, folderName, lastWriteUtc, utcNow, meter, out missReason);
             }
             catch (Exception ex)
             {
@@ -576,7 +577,59 @@ namespace MultiTerminal.MCPServer.Services
             }
         }
 
-        private SessionCatalogEntry BuildEntry(string root, string worktreeBase, string path, string folderName, DateTime lastWriteUtc, DateTime utcNow, ReadMeter meter, out string missReason)
+        internal const string AmbiguousWorktreeReason =
+            "its worktree folder name matches more than one worktree, so the right one cannot be told apart";
+
+        /// <summary>Most worktree folders listed per base before the listing counts as unknown.</summary>
+        internal const int MaxWorktreeDirs = 4096;
+
+        // Whether a directory's path, in either Claude Code encoding, is the transcript folder's name.
+        private static bool NamesFolder(string dir, string folderName) =>
+            string.Equals(EncodeProjectPath(dir), folderName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(SessionDiscovery.GetProjectFolderName(dir), folderName, StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsRootFolder(string root, string folderName) => NamesFolder(root, folderName);
+
+        /// <summary>
+        /// The worktrees in <paramref name="worktreeDirs"/> whose full path encodes to
+        /// <paramref name="folderName"/>. Pure. More than one means the folder cannot say which worktree
+        /// its sessions ran in (the encoding maps every non-alphanumeric character to '-').
+        /// </summary>
+        internal static IReadOnlyList<string> WorktreesNamingFolder(string folderName, IEnumerable<string> worktreeDirs) =>
+            (worktreeDirs ?? Enumerable.Empty<string>()).Where(d => NamesFolder(d, folderName)).ToList();
+
+        /// <summary>
+        /// Every directory one level under <c>&lt;base&gt;\.claude\worktrees</c>, for the project root and
+        /// the worktree base (both from the database or <see cref="FindRepoRoot"/>, never a transcript).
+        /// Listed once per <see cref="List"/> / <see cref="TryGetEntry"/>. Null when a listing failed or
+        /// passed <see cref="MaxWorktreeDirs"/>: the caller then cannot rule out a collision.
+        /// </summary>
+        private static IReadOnlyList<string> ListWorktreeDirs(string root, string worktreeBase)
+        {
+            var dirs = new List<string>();
+            foreach (var b in worktreeBase == null ? new[] { root } : new[] { root, worktreeBase })
+            {
+                var container = Path.Combine(b, ".claude", "worktrees");
+                try
+                {
+                    if (!Directory.Exists(container))
+                        continue;
+                    var found = Directory.EnumerateDirectories(container, "*", SearchOption.TopDirectoryOnly)
+                        .Take(MaxWorktreeDirs + 1).ToList();
+                    if (found.Count > MaxWorktreeDirs)
+                        return null;
+                    dirs.AddRange(found);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[SessionCatalog] cannot list worktrees under {b}: {ex.Message}");
+                    return null;
+                }
+            }
+            return dirs;
+        }
+
+        private SessionCatalogEntry BuildEntry(string root, string worktreeBase, IReadOnlyList<string> worktrees, string path, string folderName, DateTime lastWriteUtc, DateTime utcNow, ReadMeter meter, out string missReason)
         {
             missReason = null;
             var scan = TranscriptScan.Read(path, meter);
@@ -591,9 +644,29 @@ namespace MultiTerminal.MCPServer.Services
                 return null;
             }
 
+            // The folder encoding is lossy, so two worktrees (foo-bar, foo_bar) can share one transcript
+            // folder, and "encodes to the folder" would then resume a session in the wrong one (Codex,
+            // 056bc6b6). Decided from the worktrees on disk under the DB-derived bases, never the transcript.
+            string onlyWorktree = null;
+            if (!IsRootFolder(root, folderName))
+            {
+                if (worktrees == null)
+                {
+                    missReason = "this project's worktree folders could not be listed, so the worktree it ran in cannot be told apart";
+                    return null;
+                }
+                var named = WorktreesNamingFolder(folderName, worktrees);
+                if (named.Count > 1)
+                {
+                    missReason = AmbiguousWorktreeReason;
+                    return null;
+                }
+                onlyWorktree = named.Count == 1 ? named[0] : null;
+            }
+
             // ResolveCwd returns only a path that passed ValidateResumeCwd, so the existence check below
             // is the first filesystem call any transcript-supplied path reaches (pipeline Run 1).
-            var cwd = ResolveCwd(root, worktreeBase, folderName, scan);
+            var cwd = ResolveCwd(root, worktreeBase, folderName, scan, onlyWorktree);
             if (string.IsNullOrEmpty(cwd))
             {
                 missReason = "it ran in a folder that is not this project's folder or one of its worktrees";
@@ -656,33 +729,69 @@ namespace MultiTerminal.MCPServer.Services
         /// <c>.claude\worktrees\c8ee0eec\Docking</c>, and resuming from there would not find it.
         ///
         /// <para>Every recorded cwd is untrusted transcript text: only one that passes
-        /// <see cref="ValidateResumeCwd"/> is considered at all. Order: matching tail cwd, then matching
-        /// head cwd. A cwd that does not encode to the folder is NEVER returned (pipeline Run 1): Claude
-        /// would answer "No conversation found" from it. The one fallback is the project root for a
-        /// transcript stored in the root's own folder, because the root's encoding IS that folder's
-        /// name. Otherwise the session is dropped. Deliberately no "decode the folder name" fallback:
-        /// the encoding is lossy, and a derived path would also mask a reader that never looked at the
-        /// tail.</para>
+        /// <see cref="ValidateResumeCwd"/> is considered at all. A cwd that does not encode to the folder
+        /// is NEVER returned (pipeline Run 1): Claude would answer "No conversation found" from it.</para>
+        ///
+        /// <para>Task 056bc6b6: a validated cwd BELOW a worktree (<c>&lt;base&gt;\.claude\worktrees\&lt;id&gt;\tests\X</c>,
+        /// base = the project root or the entry's worktree base) also yields its worktree root, which is
+        /// re-validated and returned only if THAT encodes to the folder. A 46 MB transcript's 64 KB tail
+        /// held only such subfolder cwds, its last exact worktree-root cwd ~79 KB from the end, so it was
+        /// dropped. This derives from a validated cwd's own path; it is NOT the forbidden "decode the
+        /// folder name" fallback (the folder name is only compared against, never parsed).</para>
+        ///
+        /// <para>Order: an exact match anywhere in the tail, then a worktree root derived from the tail,
+        /// then exact from the head, then derived from the head. The tail is the session's latest
+        /// location, so it beats the head in either form; within one region an exact match beats a
+        /// derived one because it needs no inference. Within each pass the newest cwd wins. The one
+        /// fallback is the project root for a transcript stored in the root's own folder, because the
+        /// root's encoding IS that folder's name. Otherwise the session is dropped.</para>
         /// </summary>
-        private static string ResolveCwd(string root, string worktreeBase, string folderName, TranscriptScan scan)
+        private static string ResolveCwd(string root, string worktreeBase, string folderName, TranscriptScan scan, string onlyWorktree)
         {
+            // Codex, 056bc6b6: when exactly one existing worktree names this folder, a cwd (exact or
+            // derived) must lie in THAT worktree; encoding to the folder alone cannot prove which one.
             bool EncodesToFolder(string dir) =>
-                string.Equals(EncodeProjectPath(dir), folderName, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(SessionDiscovery.GetProjectFolderName(dir), folderName, StringComparison.OrdinalIgnoreCase);
+                NamesFolder(dir, folderName) &&
+                (onlyWorktree == null ||
+                 string.Equals(dir, onlyWorktree, StringComparison.OrdinalIgnoreCase) ||
+                 dir.StartsWith(onlyWorktree + "\\", StringComparison.OrdinalIgnoreCase));
 
-            string LastMatching(List<string> cwds)
+            // The worktree root a validated cwd lies in, re-validated, if it names the folder.
+            string DerivedWorktreeRoot(string valid)
             {
-                for (var i = cwds.Count - 1; i >= 0; i--)
+                foreach (var b in new[] { root, worktreeBase })
                 {
-                    var valid = ValidateResumeCwd(root, cwds[i], worktreeBase);
-                    if (valid != null && EncodesToFolder(valid))
-                        return valid;
+                    if (!TryCanonicalLocalPath(b, out var baseDir) || !IsUnderWorktrees(baseDir, valid))
+                        continue;
+                    var id = GetWorktreeId(baseDir, valid);
+                    if (id == null)
+                        continue;
+                    var wt = ValidateResumeCwd(root, Path.Combine(baseDir, ".claude", "worktrees", id), worktreeBase);
+                    if (wt != null && !string.Equals(wt, valid, StringComparison.OrdinalIgnoreCase) && EncodesToFolder(wt))
+                        return wt;
                 }
                 return null;
             }
 
-            return LastMatching(scan.TailCwds) ??
-                   LastMatching(scan.HeadCwds) ??
+            string LastMatching(List<string> cwds, bool derive)
+            {
+                for (var i = cwds.Count - 1; i >= 0; i--)
+                {
+                    var valid = ValidateResumeCwd(root, cwds[i], worktreeBase);
+                    if (valid == null)
+                        continue;
+                    if (!derive && EncodesToFolder(valid))
+                        return valid;
+                    if (derive && DerivedWorktreeRoot(valid) is string wt)
+                        return wt;
+                }
+                return null;
+            }
+
+            return LastMatching(scan.TailCwds, derive: false) ??
+                   LastMatching(scan.TailCwds, derive: true) ??
+                   LastMatching(scan.HeadCwds, derive: false) ??
+                   LastMatching(scan.HeadCwds, derive: true) ??
                    (EncodesToFolder(root) ? root : null);
         }
 

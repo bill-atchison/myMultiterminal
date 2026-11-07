@@ -257,7 +257,7 @@ namespace MultiTerminal.Controls
             _renderer.SetTheme(_pendingTheme);
 
             // Create and start terminal
-            _terminal = new ConPtyTerminal { DebugLogService = _debugLogService, QuietStart = QuietStart };
+            _terminal = new ConPtyTerminal { DebugLogService = _debugLogService, QuietStart = QuietStart, SubagentModel = SubagentModel };
             _terminal.DataReceived += OnTerminalDataReceived;
             _terminal.ProcessExited += OnTerminalProcessExited;
 
@@ -710,7 +710,15 @@ namespace MultiTerminal.Controls
         /// e0fa9d90). Set by TerminalDocument.StartTerminal from <see cref="TerminalRoles.IsQuietStart"/>
         /// before every launch, so a reused pane never keeps a previous project's value.
         /// </summary>
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public bool QuietStart { get; set; }
+
+        /// <summary>
+        /// The subagent model for the NEXT <see cref="Start"/> (ticket b0d2f090); set by
+        /// TerminalDocument.StartTerminal before every launch, null for none.
+        /// </summary>
+        [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+        public string SubagentModel { get; set; }
 
         private readonly CompactContinueGate _compactContinueGate = new CompactContinueGate();
 
